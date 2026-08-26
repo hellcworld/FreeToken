@@ -61,7 +61,7 @@ For More details:
 
 ## Citation
 
-If you use FreeToken for your research, please cite our [paper](https://arxiv.org/abs/2608.16157):
+If you use FreeToken in your research, please cite the **upstream** [paper](https://arxiv.org/abs/2608.16157) -- the engine and its ideas are entirely the upstream team's work:
 
 ```bibtex
 @article{yang2026freetoken,
@@ -73,6 +73,12 @@ If you use FreeToken for your research, please cite our [paper](https://arxiv.or
 ```
 
 ## Acknowledgment
+
+**This fork stands on the shoulders of the upstream project.** All engine credit
+belongs to [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) and
+its authors (Song Han, Ion Stoica, Matei Zaharia et al.) -- this fork only layers
+the two features above onto their work. Upstream's own acknowledgments are
+preserved below:
 
 FreeToken was deeply inspired by [mini-sglang](https://github.com/sgl-project/mini-sglang), and
 learned the design and reused code from the following projects:

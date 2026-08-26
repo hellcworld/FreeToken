@@ -86,6 +86,11 @@ uv pip install -e ".[accel]"
 
 ## 致谢
 
+**本 fork 站在上游项目的肩膀上。**引擎的全部核心工作归功于
+[FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken)
+及其作者(Song Han、Ion Stoica、Matei Zaharia 等团队)——本 fork 只是在他们的
+成果之上叠加了上述两个功能。以下为上游自己的致谢,原样保留:
+
 FreeToken 深受 [mini-sglang](https://github.com/sgl-project/mini-sglang) 启发,并借鉴设计与复用了以下项目的代码:
 [SGLang](https://github.com/sgl-project/sglang)、
 [vLLM](https://github.com/vllm-project/vllm)、
