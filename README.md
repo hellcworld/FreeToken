@@ -1,3 +1,5 @@
+**English** | [简体中文](README.zh-CN.md)
+
 > **Fork notice** · This is a personal fork of
 > [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) (Apache-2.0)
 > adding **Qwen3.8-27B NVFP4 support (both quant dialects)** and
