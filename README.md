@@ -14,7 +14,7 @@
 </div>
 
 <p align="center">
-| <a href="https://www.flashml.ai/"><b>Download</b></a> | <a href="https://arxiv.org/abs/2608.16157"><b>Paper</b></a> | <a href="https://join.slack.com/t/flashml/shared_invite/zt-3zpdh5j10-9dwTXrgLiqpVxizhA9KVbA"><b>Developer Slack</b></a> | <a href="https://discord.gg/xzwSnMdsX"><b>Community Discord</b></a> | <a href="https://github.com/FlashML-org/FreeToken/blob/main/assets/freetoken-wechatgroup.png"><b>Community WeChat</b></a> |
+| [Paper](https://arxiv.org/abs/2608.16157) | [Upstream](https://github.com/FlashML-org/FreeToken) |
 </p>
 
 
@@ -32,13 +32,7 @@ FreeToken is an edge-native Mixture-of-Experts (MoE) serving engine designed for
 
 ## Getting Started
 
-### Desktop app
-
-Download FreeToken for Windows or Linux at [flashml.ai](https://www.flashml.ai/). It sets the engine up for you and gives you a GUI for running models, chatting, and tuning the engine.
-
-<div align="center">
-  <img alt="FreeToken Desktop" src="https://raw.githubusercontent.com/FlashML-org/FreeToken/main/assets/desktop-console.png" width=92%>
-</div>
+> The upstream **Desktop app** (flashml.ai) is a separate official distribution and not part of this fork -- see the [upstream repo](https://github.com/FlashML-org/FreeToken).
 
 ### CLI
 
