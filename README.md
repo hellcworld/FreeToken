@@ -1,3 +1,10 @@
+> **Fork notice** · This is a personal fork of
+> [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) (Apache-2.0)
+> adding **Qwen3.8-27B NVFP4 support (both quant dialects)** and
+> **Qwen3.5/3.6/3.8 vision input** (gemma4-parity) on top of upstream `main@2757bb5`.
+> Changes, verification status and versioning: **[CHANGES.md](CHANGES.md)** ·
+> fork tag `qwen38-vision-v1.0.0`.
+
 <div align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/FlashML-org/FreeToken/main/assets/freetoken-logo-dark.svg">
