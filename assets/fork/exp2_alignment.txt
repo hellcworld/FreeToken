@@ -1,0 +1,12 @@
+=== Experiment 2: vision tower numerical alignment vs transformers 5.15 ===
+  same weights, 2 clips (16x16 image + 8x16x2 video-frames), fp32:
+  output (128, 256)  max|diff|=3.35e-07  mean|diff|=5.53e-08  -> MATCH within 2e-4
+  interleaved-mRoPE slot math vs reference rotary: max|diff| cos=0.00e+00
+Traceback (most recent call last):
+  File "C:\Users\huang\AppData\Local\Temp\exp2.py", line 53, in <module>
+    rows, delta = qwen3_5_rope_index(torch.tensor(ids), torch.tensor([[1, 8, 8]]), 248056)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\FreeToken\python\freetoken\models\qwen3_5_moe\vision.py", line 330, in qwen3_5_rope_index
+    assert t_m * h_m * w_m == span, (
+           ^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: image span (8 tokens) != grid 1x4x4

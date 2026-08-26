@@ -24,6 +24,45 @@
 
 在你已有的硬件上解锁数据中心级智能——在游戏 PC 上本地运行 290B+ 前沿 MoE 模型,获得极速交互体验。
 
+
+## ✨ 本 Fork 新增能力
+
+在上游 `main@2757bb5` 之上叠加两个功能(详情与验证:[CHANGES.md](CHANGES.md)):
+
+**1 · Qwen3.8-27B NVFP4 支持——两种量化方言**
+
+```bash
+ft serve --model RadixArk/Qwen3.8-27B-NVFP4      # modelopt 方言
+ft serve --model unsloth/Qwen3.8-27B-NVFP4       # compressed-tensors 混合 FP8+FP4
+```
+修复 #139 一类加载崩溃(剥离版 `hf_quant_config.json` 的误检测),unsloth
+混合精度布局原生服务(FP8 W8A16 注意力 + 加载时 RTN 重量化其 FP8 MLP 层)。
+稠密 27B NVFP4 权重全量驻显存,需约 22GB 显存。
+
+**2 · Qwen3.5/3.6/3.8 视觉输入(对齐 gemma4 级别)**
+
+```python
+llm = LLM(model="...", ...)          # 以 FREETOKEN_LOAD_VISION=1 启动
+out = llm.generate(
+    [含图像占位符的token序列],
+    SamplingParams(...),
+    mm_inputs=[{"pixel_values": px, "grid_thw": thw}],   # 来自 HF processor
+)
+```
+视觉塔/merger 与 transformers 参考实现逐位对齐;交错 mRoPE 位置由 `grid_thw`
+自动构建;纯文本构建与上游逐位一致。FTW 转换同样须带 `FREETOKEN_LOAD_VISION=1`。
+
+**验证实验**(CPU 加载器级 + 数值对齐;开发机无 NVIDIA GPU——≥24GB 显存上的
+GPU 端到端 serve 冒烟是剩余步骤):
+
+| 实验一——真实检查点加载 | 实验二——数值对齐 |
+|---|---|
+| ![exp1](assets/fork/exp1_loading.png) | ![exp2](assets/fork/exp2_alignment.png) |
+
+| 实验三——CPU 测试套件(15 项全部通过) |
+|---|
+| ![exp3](assets/fork/exp3_tests.png) |
+
 ## 简介
 
 FreeToken 是一个边缘原生的混合专家(MoE)推理引擎,面向在个人与消费级硬件上运行前沿规模的开源权重模型。它将异构边缘资源——GPU、CPU、主机内存与互连——视为统一的弹性推理平台。核心特性包括:

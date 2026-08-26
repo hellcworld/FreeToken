@@ -22,6 +22,47 @@
 
 Unlock datacenter-class intelligence on the hardware you already own — Run 290B+ frontier MoE models locally on your gaming PC at blistering interactive speeds.
 
+
+## ✨ What's New in This Fork
+
+Two features layered on upstream `main@2757bb5` (details & verification: [CHANGES.md](CHANGES.md)):
+
+**1 · Qwen3.8-27B NVFP4 support — both quant dialects**
+
+```bash
+ft serve --model RadixArk/Qwen3.8-27B-NVFP4      # modelopt dialect
+ft serve --model unsloth/Qwen3.8-27B-NVFP4       # compressed-tensors mixed FP8+FP4
+```
+Fixes the #139 load-failure class (stripped `hf_quant_config.json` mis-detection) and
+serves the unsloth mixed-precision layout natively (FP8 W8A16 attention + load-time RTN
+re-quant of its FP8 MLP layers). Dense 27B NVFP4 keeps all weights GPU-resident: budget
+~22 GB VRAM.
+
+**2 · Vision input for Qwen3.5/3.6/3.8 (gemma4-parity)**
+
+```python
+llm = LLM(model="...", ...)          # serve with FREETOKEN_LOAD_VISION=1
+out = llm.generate(
+    [prompt_ids_with_image_placeholders],
+    SamplingParams(...),
+    mm_inputs=[{"pixel_values": px, "grid_thw": thw}],   # from the HF processor
+)
+```
+The tower/merger are bit-faithful vs the transformers reference; interleaved-mRoPE
+positions are built automatically from `grid_thw`. Text-only builds are bit-identical
+to upstream. FTW conversion must also run with `FREETOKEN_LOAD_VISION=1`.
+
+**Verification experiments** (CPU loader-level + numerical alignment; the dev host has
+no NVIDIA GPU -- GPU end-to-end serve smoke on a ≥24 GB card is the remaining step):
+
+| Experiment 1 -- real-checkpoint loading | Experiment 2 -- numerical alignment |
+|---|---|
+| ![exp1](assets/fork/exp1_loading.png) | ![exp2](assets/fork/exp2_alignment.png) |
+
+| Experiment 3 -- CPU test suites (15 passed) |
+|---|
+| ![exp3](assets/fork/exp3_tests.png) |
+
 ## About
 
 FreeToken is an edge-native Mixture-of-Experts (MoE) serving engine designed for running frontier-scale open-weight models on personal and consumer hardware. It treats heterogeneous edge resources—GPUs, CPUs, host memory, and interconnects—as a unified, elastic inference platform. Its core features include:  
