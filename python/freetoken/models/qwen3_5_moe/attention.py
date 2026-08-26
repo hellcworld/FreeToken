@@ -9,6 +9,7 @@ from freetoken.layers.rotary import get_rope
 from freetoken.utils import nvtx_annotate
 
 from .quant_linear import make_col_merged, make_replicated
+from .vision import apply_interleaved_mrope
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -59,11 +60,24 @@ class Qwen3_5Attention(BaseOP):
             ),
         )
         self.o_proj = make_replicated(config, self.qo_attn_dim, config.hidden_size, has_bias=False)
+        # Interleaved mRoPE (vision builds): the Qwen3.5 full-attention rope selects the
+        # T/H/W axis per frequency slot (slot i -> axis i%3, frequencies continuous), so a
+        # 1-D position cache cannot express it. Multimodal prefills carry explicit 3-row
+        # positions in batch.mm_positions and take the per-token cos/sin path below; text
+        # rows are all equal, which degenerates to exactly the plain partial rope.
+        self._mrope_section = config.rotary_config.mrope_section
+        if self._mrope_section is not None:
+            dim = config.rotary_config.rotary_dim
+            self._mrope_inv_freq = 1.0 / (
+                config.rotary_config.base
+                ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
+            )
 
     def _project(self, x: torch.Tensor):
         """Returns (q, k, v, gate): q [N, num_q, head_dim] post qk-norm+rope,
         k [N, num_kv*head_dim] post norm+rope, v [N, num_kv*head_dim], gate [N, num_q*head_dim]."""
-        positions = get_global_ctx().batch.positions
+        batch = get_global_ctx().batch
+        positions = batch.positions
         qkv = self.qkv_proj.forward(x)
         qg, k, v = torch.split(qkv, self._qkv_split, dim=-1)
         qg = qg.view(-1, self.num_q, self.head_dim * 2)
@@ -73,7 +87,13 @@ class Qwen3_5Attention(BaseOP):
         v = v.contiguous()  # split view has the qkv row stride; the KV store needs contiguous
         q = self.q_norm.forward(q).reshape(-1, self.qo_attn_dim)
         k = self.k_norm.forward(k).reshape(-1, self.kv_attn_dim)
-        q, k = self.rotary.forward(positions, q, k)
+        mm_positions = getattr(batch, "mm_positions", None)
+        if mm_positions is not None:
+            q, k = apply_interleaved_mrope(
+                mm_positions, self._mrope_inv_freq, self._mrope_section, q, k
+            )
+        else:
+            q, k = self.rotary.forward(positions, q, k)
         return q.view(-1, self.num_q, self.head_dim), k, v, gate
 
     def _combine(self, attn_out: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:

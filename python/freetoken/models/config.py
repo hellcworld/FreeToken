@@ -104,6 +104,9 @@ class RotaryConfig:
     max_position: int
     base: float
     scaling: Dict[str, Any] | None
+    # Interleaved-mRoPE section sizes [T, H, W] (Qwen3.5+ vision models; sum ==
+    # rotary_dim // 2). None -> plain partial rope (every model except qwen3_5 vision).
+    mrope_section: Tuple[int, int, int] | None = None
 
 
 @dataclass(frozen=True)

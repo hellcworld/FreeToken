@@ -78,9 +78,25 @@ class Qwen3_5Model(BaseOP):
             [Qwen3_5DecoderLayer(config, layer_id) for layer_id in range(config.num_layers)]
         )
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self._image_token_id = config.image_token_id
+
+    def _merge_multimodal(self, input_ids: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """Replace the ``image_token_id`` placeholder embeddings with the vision tower
+        output gathered in ``batch.mm_embeds`` (request order == placeholder order)."""
+        mm_embeds = get_global_ctx().batch.mm_embeds
+        if mm_embeds is None:
+            return x
+        mask = input_ids == self._image_token_id
+        n_slots = int(mask.sum())
+        assert n_slots == mm_embeds.shape[0], (
+            f"image placeholders ({n_slots}) != image embeddings ({mm_embeds.shape[0]}); "
+            "image tokens must not be split across prefill chunks"
+        )
+        return x.masked_scatter(mask.unsqueeze(-1), mm_embeds.to(x.dtype))
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens.forward(input_ids)
+        x = self._merge_multimodal(input_ids, x)
         residual: torch.Tensor | None = None
         for layer in self.layers.op_list:
             x, residual = layer.forward(x, residual)
@@ -91,6 +107,14 @@ class Qwen3_5Model(BaseOP):
 class Qwen3_5MoEForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig):
         self.model = Qwen3_5Model(config)
+        if config.is_multimodal:
+            # FREETOKEN_LOAD_VISION=1 build: the Qwen-VL tower + patch merger (~0.9 GiB
+            # bf16, never quantized in any dialect), mounted on the shared vision
+            # prefixes so the FTW replay skip and weight loader line up (gemma4 pattern).
+            from .vision import Qwen3_5PatchMerger, Qwen3_5VisionTower
+
+            self.vision_tower = Qwen3_5VisionTower(config.vision_config)
+            self.embed_vision = Qwen3_5PatchMerger(config.vision_config)
         if getattr(config, "lm_head_quant", "none") == "nvfp4":
             # checkpoint stores the (untied) lm_head as NVFP4: keep it native (W4A16) -- the
             # bf16 dequant of this ~1 GB matrix was the single largest decode kernel.
@@ -112,6 +136,21 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)
         return self.lm_head.forward(output)
+
+    @torch.inference_mode()
+    def encode_images(
+        self,
+        pixel_values: torch.Tensor,
+        image_position_ids: torch.Tensor | None = None,
+        grid_thw: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Qwen-VL inputs: ``pixel_values`` [total_patches, C*T*P*P] + ``grid_thw``
+        [n, 3] from the HF processor. Returns [num_image_tokens, hidden] in image
+        order (tower patches are concatenated per image; the merger's 2x2 merge keeps
+        that order). ``image_position_ids`` is the gemma4-style argument and unused."""
+        assert grid_thw is not None, "qwen3_5 encode_images needs processor grid_thw"
+        features = self.vision_tower.forward(pixel_values, grid_thw)
+        return self.embed_vision.forward(features)
 
 
 __all__ = ["Qwen3_5MoEForCausalLM"]

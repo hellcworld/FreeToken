@@ -139,10 +139,23 @@ def _load_maybe_quantized(f, raw_name: str, keyset: set[str]) -> torch.Tensor:
     return tensor
 
 
-def _rename(raw_name: str) -> str | None:
-    """HF key -> FreeToken state-dict key, or None to skip."""
-    if raw_name.startswith(("mtp.", "model.visual.", "visual.")):
+def _rename(raw_name: str, include_vision: bool = False) -> str | None:
+    """HF key -> FreeToken state-dict key, or None to skip.
+
+    With ``include_vision`` (multimodal build, ``FREETOKEN_LOAD_VISION=1``) the Qwen-VL
+    tower maps onto the shared vision prefixes so the FTW replay skip and the model's
+    top-level attributes line up: ``model.visual.{patch_embed,pos_embed,blocks}.*`` ->
+    ``vision_tower.*`` and ``model.visual.merger.*`` -> ``embed_vision.*``. Text-only
+    builds keep dropping the whole visual stack."""
+    if raw_name.startswith("mtp."):
         return None
+    if raw_name.startswith(("model.visual.", "visual.")):
+        if not include_vision:
+            return None
+        name = raw_name[raw_name.index("visual.") + len("visual."):]
+        if name.startswith("merger."):
+            return "embed_vision." + name[len("merger."):]
+        return "vision_tower." + name
     # ModelOpt FP8 KV-cache static scales (full-attention layers only). FreeToken keeps the
     # KV cache in the engine's native precision (>= the checkpoint's quantized KV), so these
     # per-tensor q/k/v scales are unused -- drop them rather than fail as unexpected keys.
@@ -214,12 +227,13 @@ def iter_weights(
             include_non_moe=include_non_moe, include_moe_experts=include_moe_experts,
             nvfp4=config.dense_quant == "nvfp4",
             fp8_attn=config.attn_quant == "fp8_pertensor",
+            include_vision=config.is_multimodal,
         )
         return
     if config.expert_quant == "fp8_block":
         # Dense (attn/GDN/shared-expert) weights are always block-fp8; routed experts are
         # yielded here only for the resident path (include_moe_experts=True). Under offload
-        # they are excluded and loaded by setup_offload_expert_banks instead.
+        # they are excluded and loaded by setup_offload_expert_bank instead.
         yield from _iter_weights_fp8(
             model_path, device,
             include_non_moe=include_non_moe, include_moe_experts=include_moe_experts,
@@ -235,6 +249,7 @@ def iter_weights(
             include_non_moe=include_non_moe, include_moe_experts=include_moe_experts,
             dense_nvfp4=config.dense_quant == "nvfp4",
             lmhead_nvfp4=config.lm_head_quant == "nvfp4",
+            include_vision=config.is_multimodal,
         )
         return
     tp_info = get_tp_info()
@@ -246,6 +261,7 @@ def iter_weights(
     # dequantizing to bf16. lm_head here is bf16 (pure NVFP4 doesn't quantize it).
     dense_nvfp4 = config.dense_quant == "nvfp4"
     lmhead_nvfp4 = config.lm_head_quant == "nvfp4"
+    include_vision = config.is_multimodal
     shared_buf: dict[str, dict[str, torch.Tensor]] = {}
     nvfp4_shared_buf: dict[str, dict[str, tuple]] = {}
     fuse_buf: dict[str, dict[int, torch.Tensor]] = {}
@@ -267,8 +283,12 @@ def iter_weights(
                 if raw_name.endswith(_SCALE_SUFFIXES):
                     continue
 
-                name = _rename(raw_name)
+                name = _rename(raw_name, include_vision)
                 if name is None:
+                    continue
+                if name.startswith(("vision_tower.", "embed_vision.")):
+                    # Vision stack: never quantized in any dialect -- bypass everything.
+                    yield name, f.get_tensor(raw_name)
                     continue
 
                 is_expert = _PACKED_EXPERT_PATTERN.match(name) is not None
@@ -454,7 +474,7 @@ def _dense_nvfp4_emit(
 
 def _iter_weights_attn_fp8(
     model_path: str, device: torch.device, *, include_non_moe: bool, include_moe_experts: bool,
-    dense_nvfp4: bool = False, lmhead_nvfp4: bool = False,
+    dense_nvfp4: bool = False, lmhead_nvfp4: bool = False, include_vision: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Dense pass for the modelopt MIXED_PRECISION Qwen3.5 checkpoint.
 
@@ -491,8 +511,11 @@ def _iter_weights_attn_fp8(
                 if raw_name.endswith(_SCALE_SUFFIXES):
                     continue  # scales consumed with their .weight
 
-                name = _rename(raw_name)
+                name = _rename(raw_name, include_vision)
                 if name is None:
+                    continue
+                if name.startswith(("vision_tower.", "embed_vision.")):
+                    yield name, f.get_tensor(raw_name)  # bf16 vision stack, never quantized
                     continue
                 if _PACKED_EXPERT_PATTERN.match(name) is not None:
                     continue  # no packed experts in this checkpoint; guard anyway
@@ -640,7 +663,7 @@ def _fold_fp8_mlp_into_nvfp4(f, raw_base: str, base: str):
 
 def _iter_weights_compressed_tensors(
     model_path: str, device: torch.device, *, include_non_moe: bool, include_moe_experts: bool,
-    nvfp4: bool, fp8_attn: bool = False,
+    nvfp4: bool, fp8_attn: bool = False, include_vision: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Dense pass for a compressed-tensors NVFP4 checkpoint (e.g. Qwen3.6-27B).
 
@@ -694,13 +717,18 @@ def _iter_weights_compressed_tensors(
             disable=not tp_info.is_primary(),
         ):
             for raw_name in reader.names_in(file):
-                if raw_name.startswith(("mtp.", "model.visual.", "visual.")):
+                if raw_name.startswith("mtp."):
+                    continue
+                if not include_vision and raw_name.startswith(("model.visual.", "visual.")):
                     continue
                 if raw_name.endswith(_CT_SCALE_SUFFIXES):
                     continue  # consumed with weight_packed (or unused W4A4 activation scales)
 
-                name = _rename(raw_name)
+                name = _rename(raw_name, include_vision)
                 if name is None:
+                    continue
+                if name.startswith(("vision_tower.", "embed_vision.")):
+                    yield name, reader.get_tensor(raw_name)  # bf16 vision stack
                     continue
 
                 if raw_name.endswith(".weight_packed"):  # NVFP4 projection

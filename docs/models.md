@@ -46,4 +46,11 @@ for them; other checkpoints of the same architectures work too.
   W8A16 and the FP8 MLP layers are folded into the native NVFP4 buffers at
   load). Dense 27B weights are fully GPU-resident: budget ~22 GB of VRAM for
   an NVFP4 build (~56 GB BF16).
-- Multimodal checkpoints are served text-only.
+- Multimodal checkpoints are served text-only, except Gemma-4 and Qwen3.5/3.6/3.8
+  with `FREETOKEN_LOAD_VISION=1`: the vision tower then loads (~0.9 GiB bf16 for
+  Qwen; FTW conversion must also run with the flag or the vision weights are
+  dropped from the FTW build). Qwen image input follows the offline
+  `LLM.generate(mm_inputs=[{"pixel_values": ..., "grid_thw": ...}])` contract --
+  token-id prompts with `image_token_id` placeholders; interleaved-mRoPE rows are
+  built automatically. The online server remains text-only (as for gemma4). Video
+  spans are not supported yet.

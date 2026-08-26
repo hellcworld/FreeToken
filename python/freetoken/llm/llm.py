@@ -44,15 +44,21 @@ class LLM(Scheduler):
 
     @torch.inference_mode()
     def encode_images(
-        self, pixel_values: torch.Tensor, image_position_ids: torch.Tensor
+        self,
+        pixel_values: torch.Tensor,
+        image_position_ids: torch.Tensor | None = None,
+        grid_thw: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run the vision tower + projector on processor outputs, returning the
-        ``[num_image_tokens, hidden]`` soft-token embeddings (on device)."""
+        ``[num_image_tokens, hidden]`` soft-token embeddings (on device). gemma4-style
+        callers pass ``image_position_ids``; Qwen-VL callers pass ``grid_thw``."""
         model = self.engine.model
         if not hasattr(model, "encode_images"):
             raise RuntimeError(f"{type(model).__name__} does not support image inputs")
         return model.encode_images(
-            pixel_values.to(self.device), image_position_ids.to(self.device)
+            pixel_values.to(self.device),
+            None if image_position_ids is None else image_position_ids.to(self.device),
+            None if grid_thw is None else grid_thw.to(self.device),
         )
 
     def _tokenize_one(self, prompt: List[int] | str) -> torch.Tensor:
@@ -78,6 +84,8 @@ class LLM(Scheduler):
                     input_ids=input_ids,
                     sampling_params=sampling_params,
                     mm_embeds=self.mm_embeds_map.get(uid),
+                    mm_positions=self.mm_positions_map.get(uid),
+                    mm_rope_delta=self.mm_delta_map.get(uid, 0),
                 )
             )
             self.status_map[uid] = RequestStatus(
@@ -111,13 +119,17 @@ class LLM(Scheduler):
         """Offline generation.
 
         ``mm_inputs`` (optional) is aligned with ``prompts``; each entry is either
-        ``None`` (text-only) or a dict with ``pixel_values`` ``[N, P, 3*patch**2]`` and
-        ``image_position_ids`` ``[N, P, 2]`` from the HF processor. For multimodal
-        prompts pass token-id ``prompts`` containing ``image_token_id`` placeholders.
+        ``None`` (text-only) or a model-specific dict from the HF processor: gemma4
+        uses ``pixel_values`` + ``image_position_ids``, qwen3_5 vision uses
+        ``pixel_values`` + ``grid_thw`` (the interleaved-mRoPE rows are built here
+        from the token-id prompt). For multimodal prompts pass token-id ``prompts``
+        containing the model's image-token placeholders.
         """
         self.pending_requests = []
         self.status_map = {}
         self.mm_embeds_map = {}
+        self.mm_positions_map: Dict[int, torch.Tensor] = {}
+        self.mm_delta_map: Dict[int, int] = {}
         self.counter = 0
         if isinstance(sampling_params, SamplingParams):
             sampling_params = [sampling_params] * len(prompts)
@@ -127,8 +139,25 @@ class LLM(Scheduler):
             for uid, mm in enumerate(mm_inputs):
                 if mm is not None:
                     self.mm_embeds_map[uid] = self.encode_images(
-                        mm["pixel_values"], mm["image_position_ids"]
+                        mm["pixel_values"],
+                        mm.get("image_position_ids"),
+                        mm.get("grid_thw"),
                     )
+                    if mm.get("grid_thw") is not None and "mm_position_ids" not in mm:
+                        # qwen3_5 interleaved mRoPE rows, built from the token prompt
+                        from freetoken.models.qwen3_5_moe.vision import qwen3_5_rope_index
+
+                        prompt = prompts[uid]
+                        assert isinstance(prompt, list), (
+                            "multimodal qwen prompts must be token ids with placeholders"
+                        )
+                        image_token_id = self.engine.model.model._image_token_id
+                        rows, delta = qwen3_5_rope_index(
+                            torch.tensor(prompt, dtype=torch.int64), mm["grid_thw"],
+                            image_token_id,
+                        )
+                        self.mm_positions_map[uid] = rows
+                        self.mm_delta_map[uid] = delta
             torch.cuda.synchronize(self.device)
         try:
             self.run_forever()

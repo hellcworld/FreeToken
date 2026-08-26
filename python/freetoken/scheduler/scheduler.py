@@ -827,6 +827,11 @@ class Scheduler(SchedulerIOMixin):
         parts = [req.mm_embeds for req in batch.reqs if req.mm_embeds is not None]
         if parts:
             batch.mm_embeds = torch.cat(parts, dim=0)
+        pos_parts = [req.mm_positions for req in batch.reqs if req.mm_positions is not None]
+        if pos_parts and len(pos_parts) == len(batch.reqs):
+            # interleaved-mRoPE rows, in batch order (multimodal prompts are never
+            # chunked, so each req contributes its full prompt's rows)
+            batch.mm_positions = torch.cat(pos_parts, dim=1)
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
@@ -880,9 +885,12 @@ def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
     offset = 0
     for req in batch.padded_reqs:
         length = req.extend_len
+        # mm_rope_delta shifts a multimodal request's positions past its image spans
+        # (interleaved-mRoPE rope_deltas); 0 for every text-only request.
+        delta = getattr(req, "mm_rope_delta", 0)
         torch.arange(
-            req.cached_len,
-            req.device_len,
+            req.cached_len + delta,
+            req.device_len + delta,
             dtype=torch.int32,
             out=indices_host[offset : offset + length],
         )

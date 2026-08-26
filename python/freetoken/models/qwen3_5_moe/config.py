@@ -3,6 +3,7 @@ from __future__ import annotations
 import functools
 import json
 import os
+from dataclasses import dataclass
 from typing import Any
 
 from freetoken.models.config import (
@@ -12,7 +13,53 @@ from freetoken.models.config import (
     RotaryConfig,
     detect_compressed_tensors_mixed_fp8,
     detect_compressed_tensors_nvfp4,
+    vision_load_enabled,
 )
+
+
+@dataclass(frozen=True)
+class Qwen3_5VisionConfig:
+    """The Qwen3.5/3.6/3.8 ``vision_config`` (a Qwen-VL-style ViT + patch merger).
+
+    Field names mirror the HF ``Qwen3_5VisionConfig``; ``hidden_size`` is the tower's
+    width (1152 at 27B/35B), ``out_hidden_size`` the text hidden the merger emits.
+    """
+
+    depth: int
+    hidden_size: int
+    num_heads: int
+    intermediate_size: int
+    patch_size: int
+    temporal_patch_size: int
+    spatial_merge_size: int
+    out_hidden_size: int
+    num_position_embeddings: int
+    in_channels: int = 3
+
+    @property
+    def head_dim(self) -> int:
+        return self.hidden_size // self.num_heads
+
+
+def _parse_vision_config(hf_config: Any) -> Qwen3_5VisionConfig | None:
+    """Text-only unless ``FREETOKEN_LOAD_VISION`` is set (same opt-in as gemma4): the
+    tower + merger are ~0.9 GiB of never-quantized bf16 weights that text-only serving
+    never touches. Returns None for a text-only build or when vision is disabled."""
+    vc = getattr(hf_config, "vision_config", None)
+    if vc is None or not vision_load_enabled():
+        return None
+    return Qwen3_5VisionConfig(
+        depth=vc.depth,
+        hidden_size=vc.hidden_size,
+        num_heads=vc.num_heads,
+        intermediate_size=vc.intermediate_size,
+        patch_size=vc.patch_size,
+        temporal_patch_size=getattr(vc, "temporal_patch_size", 2),
+        spatial_merge_size=getattr(vc, "spatial_merge_size", 2),
+        out_hidden_size=vc.out_hidden_size,
+        num_position_embeddings=vc.num_position_embeddings,
+        in_channels=getattr(vc, "in_channels", 3),
+    )
 
 
 def _modelopt_quant_file(hf_config: Any) -> dict | None:
@@ -264,12 +311,14 @@ def parse_config(hf_config: Any) -> ModelConfig:
     full_ids = tuple(i for i, t in enumerate(layer_types) if t == "full_attention")
     linear_ids = tuple(i for i, t in enumerate(layer_types) if t == "linear_attention")
 
+    mrope_section = rope_params.get("mrope_section")
     full_rotary = RotaryConfig(
         head_dim=head_dim,
         rotary_dim=rotary_dim,
         max_position=text.max_position_embeddings,
         base=rope_theta,
         scaling=rope_scaling,
+        mrope_section=tuple(mrope_section) if mrope_section else None,
     )
     full_group = FullAttentionGroupConfig(
         name="full",
@@ -317,7 +366,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         use_qk_norm=True,
         model_type=getattr(hf_config, "model_type", "qwen3_5_moe"),
         architectures=getattr(hf_config, "architectures", ["Qwen3_5MoeForConditionalGeneration"]),
-        vision_config=None,  # text-only milestone
+        vision_config=_parse_vision_config(hf_config),
         image_token_id=getattr(hf_config, "image_token_id", None),
         attention_groups=groups,
         expert_quant=expert_quant,
