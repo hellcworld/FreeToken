@@ -74,6 +74,29 @@ def detect_compressed_tensors_nvfp4(hf_config: Any) -> bool:
     return saw_nvfp4
 
 
+def detect_compressed_tensors_mixed_fp8(hf_config: Any) -> bool:
+    """Detect a compressed-tensors checkpoint that keeps (part of) the Linear targets
+    FP8 W8A8 instead of NVFP4 -- an llm-compressor "mixed-precision" export with an
+    8-bit float weights group alongside the NVFP4 group (e.g. unsloth/Qwen3.8-27B-NVFP4:
+    NVFP4 MLP but FP8 per-channel attention/GDN projections and lm_head).
+
+    Such checkpoints serve the 8-bit projections on the per-tensor-FP8 W8A16 path
+    (their per-channel weight scales are exactly the per-output-row scales the fp8
+    kernels want) instead of W4A16."""
+    quant = getattr(hf_config, "quantization_config", None)
+    if quant is None:
+        return False
+    get = quant.get if isinstance(quant, dict) else (lambda k, d=None: getattr(quant, k, d))
+    if str(get("quant_method") or "").lower() != "compressed-tensors":
+        return False
+    groups = get("config_groups") or {}
+    for g in (groups.values() if isinstance(groups, dict) else []):
+        w = (g or {}).get("weights") or {}
+        if int(w.get("num_bits", 0) or 0) == 8 and str(w.get("type", "")).lower() == "float":
+            return True
+    return False
+
+
 @dataclass(frozen=True)
 class RotaryConfig:
     head_dim: int

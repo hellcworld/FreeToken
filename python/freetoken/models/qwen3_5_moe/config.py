@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import functools
+import json
+import os
 from typing import Any
 
 from freetoken.models.config import (
@@ -7,17 +10,77 @@ from freetoken.models.config import (
     LinearGatedDeltaGroupConfig,
     ModelConfig,
     RotaryConfig,
+    detect_compressed_tensors_mixed_fp8,
     detect_compressed_tensors_nvfp4,
 )
 
 
+def _modelopt_quant_file(hf_config: Any) -> dict | None:
+    """modelopt checkpoints ALSO ship their quant config in ``hf_quant_config.json``
+    (under ``quantization``), mirrored into config.json's ``quantization_config`` by the
+    nvidia export pipeline. Exports that strip the mirror (the Desktop catalog builds)
+    then parse as *unquantized* and misroute into the pure-NVFP4 loader, which
+    dequantizes every tensor through the GPU kernel at load -- the #139 failure mode.
+    Returns the file's ``quantization`` dict, or None when there is no such file."""
+    path = getattr(hf_config, "name_or_path", None) or getattr(hf_config, "_name_or_path", None)
+    if not isinstance(path, str) or not path:
+        return None
+    key = os.path.abspath(path) if os.path.isdir(path) else path
+    return _modelopt_quant_file_cached(key)
+
+
+@functools.cache
+def _modelopt_quant_file_cached(key: str) -> dict | None:
+    def _read(fp: str) -> dict | None:
+        with open(fp, encoding="utf-8") as f:
+            data = json.load(f)
+        quant = data.get("quantization") if isinstance(data, dict) else None
+        return quant if isinstance(quant, dict) and quant else None
+
+    if os.path.isfile(os.path.join(key, "hf_quant_config.json")):
+        return _read(os.path.join(key, "hf_quant_config.json"))
+    if os.path.isdir(key):  # local dir without the file
+        return None
+    try:  # hub id: small file, cached by huggingface_hub after the first fetch
+        from huggingface_hub import hf_hub_download
+
+        return _read(hf_hub_download(key, "hf_quant_config.json"))
+    except Exception:  # noqa: BLE001 -- no file / offline -> detection stays config-only
+        return None
+
+
 def _quant_accessor(hf_config: Any):
     """A ``get(key, default=None)`` accessor over the HF ``quantization_config`` (dict or
-    object), or ``None`` when the model has no quant config."""
+    object), or ``None`` when the model has no quant config.
+
+    Keys missing from config.json's copy fall back to ``hf_quant_config.json`` (the
+    modelopt source of truth), so a stripped export still detects like its mirrored
+    sibling; config.json always wins per key."""
     quant = getattr(hf_config, "quantization_config", None)
-    if quant is None:
+    file_quant = _modelopt_quant_file(hf_config) if quant is None or not _has_modelopt_fields(quant) else None
+    if quant is None and file_quant is None:
         return None
-    return quant.get if isinstance(quant, dict) else (lambda k, d=None: getattr(quant, k, d))
+    merged = dict(file_quant or {})
+    if quant is not None:
+        if isinstance(quant, dict):
+            merged.update({k: v for k, v in quant.items() if v is not None})
+        else:
+            for k in ("quant_method", "quant_algo", "quantized_layers", "weight_block_size"):
+                v = getattr(quant, k, None)
+                if v is not None:
+                    merged[k] = v
+    return merged.get
+
+
+def _has_modelopt_fields(quant: Any) -> bool:
+    """Does config.json's quantization_config already carry the modelopt fields the
+    detectors read? (``quant_algo`` / ``quantized_layers``.)"""
+    if isinstance(quant, dict):
+        return quant.get("quant_algo") is not None or quant.get("quantized_layers") is not None
+    return (
+        getattr(quant, "quant_algo", None) is not None
+        or getattr(quant, "quantized_layers", None) is not None
+    )
 
 
 def _fp8_block_quant(hf_config: Any) -> tuple[str, tuple[int, int] | None]:
@@ -182,8 +245,13 @@ def parse_config(hf_config: Any) -> ModelConfig:
     # compressed-tensors NVFP4 (dense Qwen3.6-27B): the attention (q/k/v/o, GDN out_proj) AND
     # the dense MLP are W4A16 NVFP4; GDN in_proj_*, lm_head, norms stay bf16. Wire the shared
     # W4A16 kernels (attn_quant=="nvfp4" routes the attention/GDN linears through them too).
+    # Mixed-precision CT export (an 8-bit float group alongside the NVFP4 one, e.g.
+    # unsloth/Qwen3.8-27B-NVFP4): the FP8 per-channel projections (attention/GDN/lm_head,
+    # trailing dense-MLP layers) serve on the per-tensor-FP8 W8A16 path instead -- a
+    # per-channel weight scale IS the per-output-row scale those kernels consume.
     if _compressed_tensors_nvfp4(hf_config):
-        attn_quant = "nvfp4"
+        mixed_fp8 = detect_compressed_tensors_mixed_fp8(hf_config)
+        attn_quant = "fp8_pertensor" if mixed_fp8 else "nvfp4"
         dense_quant = "nvfp4"
         lm_head_quant = "none"
 
