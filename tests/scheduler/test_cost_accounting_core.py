@@ -50,25 +50,25 @@ def _tokenize_msg(uid: int) -> TokenizeMsg:
 
 def test_successful_tokenization_does_not_account_prompt_before_admission():
     class Tokenizer:
-        def tokenize(self, messages):
-            return [torch.tensor([10, 11, 12], dtype=torch.int32)]
+        def tokenize_with_mm(self, msg):
+            return torch.tensor([10, 11, 12], dtype=torch.int32), None, None
 
-    ok, tensors, errors = _tokenize_requests(Tokenizer(), [_tokenize_msg(1)], _Logger())
+    ok, tensors, errors, mm_px, mm_grid = _tokenize_requests(Tokenizer(), [_tokenize_msg(1)], _Logger())
     assert [msg.uid for msg in ok] == [1]
     assert tensors[0].tolist() == [10, 11, 12]
     assert errors == []  # in particular, no early prompt_tokens_delta UserReply
+    assert mm_px == [None] and mm_grid == [None]
 
 
 def test_tokenization_failure_and_empty_prompt_are_terminal_without_usage():
     class Tokenizer:
-        def tokenize(self, messages):
-            uid = messages[0].uid
-            if uid == 2:
+        def tokenize_with_mm(self, msg):
+            if msg.uid == 2:
                 raise ValueError("bad template")
-            return [torch.empty(0, dtype=torch.int32)]
+            return torch.empty(0, dtype=torch.int32), None, None
 
     logger = _Logger()
-    ok, tensors, errors = _tokenize_requests(
+    ok, tensors, errors, _, _ = _tokenize_requests(
         Tokenizer(), [_tokenize_msg(2), _tokenize_msg(3)], logger
     )
     assert ok == [] and tensors == []
