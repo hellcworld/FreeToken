@@ -16,7 +16,6 @@ from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -103,7 +102,12 @@ def register_anthropic_routes(
             return _anthropic_error_response(
                 400, "invalid_request_error", _validation_error_message(exc)
             )
-        return await request_validation_exception_handler(request, exc)
+        # Same 422 {"detail": [...]} wire format as FastAPI's default handler, but over
+        # sanitized errors: malformed bodies (e.g. non-UTF-8 bytes) put the raw body into
+        # a ctx value and the default jsonable_encoder crashes on bytes.decode().
+        return JSONResponse(
+            status_code=422, content={"detail": _json_safe_validation_errors(exc)}
+        )
 
 
 async def handle_anthropic_messages(
@@ -608,6 +612,28 @@ def _parse_json_args(arguments: Any) -> dict[str, Any]:
         except json.JSONDecodeError:
             return {}
     return {}
+
+
+def _json_safe_validation_errors(exc: RequestValidationError) -> list[dict[str, Any]]:
+    """exc.errors() reduced to JSON-serializable dicts.
+
+    Malformed bodies (e.g. GBK bytes where UTF-8 is expected) put the raw bytes into
+    error ctx/input values; the default FastAPI encoder calls bytes.decode() on them,
+    which raises UnicodeDecodeError and turns a 422 into a 500.
+    """
+
+    def scrub(value: Any) -> Any:
+        if isinstance(value, bytes | bytearray | memoryview):
+            return bytes(value).decode("utf-8", "replace")
+        if value is None or isinstance(value, str | int | float | bool):
+            return value
+        if isinstance(value, list | tuple):
+            return [scrub(v) for v in value]
+        if isinstance(value, dict):
+            return {str(k): scrub(v) for k, v in value.items()}
+        return str(value)
+
+    return [{k: scrub(v) for k, v in err.items()} for err in exc.errors()]
 
 
 def _validation_error_message(exc: RequestValidationError) -> str:

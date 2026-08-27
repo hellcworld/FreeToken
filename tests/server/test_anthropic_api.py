@@ -866,3 +866,63 @@ def test_tool_result_carries_the_wire_tool_use_id():
     results = [m for m in spec.messages if m["role"] == "tool"]
     assert [(m["tool_call_id"], m["content"]) for m in results] == [
         ("toolu_b", "60F"), ("toolu_a", "72F")]
+
+
+# --------------------------------------------------------------------------- #
+# Malformed (non-UTF-8) request bodies must yield a clean 4xx, never a 500.
+# FastAPI's default validation handler crashes encoding the raw bytes that end
+# up in the error ctx (jsonable_encoder -> bytes.decode()).
+# --------------------------------------------------------------------------- #
+def _gbk_body() -> bytes:
+    # '{"messages": [{"role": "user", "content": "<GBK bytes of 只>"}]}' -- valid JSON
+    # framing, invalid UTF-8 payload, exactly what a GBK console client sends.
+    return b'{"messages": [{"role": "user", "content": "\xd6\xbb"}]}'
+
+
+def test_route_non_utf8_body_chat_completions_returns_422():
+    fake = FakeState([("x", True, 1, 1)])
+    client = _client(fake)
+    r = client.post(
+        "/v1/chat/completions",
+        content=_gbk_body(),
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status_code == 422, r.text
+    assert "detail" in r.json()
+
+
+def test_route_non_utf8_body_messages_returns_anthropic_400():
+    fake = FakeState([("x", True, 1, 1)])
+    client = _client(fake)
+    r = client.post(
+        "/v1/messages",
+        content=_gbk_body(),
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status_code == 400, r.text
+    body = r.json()
+    assert body["type"] == "error"
+    assert body["error"]["type"] == "invalid_request_error"
+
+
+def test_json_safe_validation_errors_scrubs_bytes():
+    from freetoken.server.anthropic_api import _json_safe_validation_errors
+
+    class _Exc(Exception):
+        def errors(self):
+            return [
+                {
+                    "type": "json_invalid",
+                    "loc": ("body", 21),
+                    "msg": "Invalid JSON body",
+                    "input": b'raw \xd6\xbb bytes',
+                    "ctx": {"error": b"\xd6\xbb", "nested": [b"\xff", {"k": (b"\xfe", 1)}]},
+                }
+            ]
+
+    out = _json_safe_validation_errors(_Exc())
+    assert out[0]["input"] == "raw \ufffd\ufffd bytes"
+    assert out[0]["ctx"]["error"] == "\ufffd\ufffd"
+    assert out[0]["ctx"]["nested"] == ["\ufffd", {"k": ["\ufffd", 1]}]
+    assert out[0]["loc"] == ["body", 21]
+    json.dumps(out)  # fully JSON-serializable
