@@ -214,8 +214,18 @@ def convert_anthropic_prompt(
                 # -> reasoning_content; redacted_thinking stays skipped (opaque payload).
                 thinking_parts.append(block.thinking)
             elif block.type == "image":
-                # Text-only server: drop image blocks rather than failing the request.
-                continue
+                # Anthropic image source -> OpenAI image_url part (render_messages
+                # keeps it for the tokenizer worker's multimodal path). Unrecognized
+                # source shapes are skipped as before.
+                src = block.source or {}
+                if src.get("type") == "base64" and src.get("data"):
+                    media = src.get("media_type") or "image/png"
+                    url = f"data:{media};base64,{src['data']}"
+                elif src.get("type") == "url" and src.get("url"):
+                    url = str(src["url"])
+                else:
+                    continue
+                content_parts.append({"type": "image_url", "image_url": {"url": url}})
             elif block.type == "tool_use":
                 tool_calls.append(
                     {

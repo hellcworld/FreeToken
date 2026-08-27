@@ -520,6 +520,8 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
+            if msg.mm_pixel_values is not None and not self._encode_online_mm(msg):
+                return
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
@@ -833,6 +835,41 @@ class Scheduler(SchedulerIOMixin):
             # chunked, so each req contributes its full prompt's rows)
             batch.mm_positions = torch.cat(pos_parts, dim=1)
 
+    def _encode_online_mm(self, msg: UserMsg) -> bool:
+        """Online multimodal admission: run the resident vision tower over the
+        tokenizer worker's processor outputs and fill the request's mm fields --
+        the serialized twin of the offline ``LLM.generate`` path. Returns False
+        after replying with a terminal error (per-request failure, the loop
+        itself must survive any image)."""
+        try:
+            model = self.engine.model
+            if not hasattr(model, "encode_images"):
+                raise ValueError("this checkpoint does not support image inputs")
+            from freetoken.models.qwen3_5_moe.vision import qwen3_5_rope_index
+
+            with torch.inference_mode():
+                msg.mm_embeds = model.encode_images(
+                    msg.mm_pixel_values, None, msg.mm_grid_thw
+                )
+                rows, delta = qwen3_5_rope_index(
+                    msg.input_ids.to(torch.int64), msg.mm_grid_thw,
+                    model.model._image_token_id,
+                )
+            msg.mm_positions = rows
+            msg.mm_rope_delta = delta
+        except Exception as exc:  # noqa: BLE001
+            logger.warning_rank0(
+                "online image encoding failed for request %d: %r", msg.uid, exc
+            )
+            self.send_result([
+                ErrorReplyMsg(uid=msg.uid, error=f"could not encode image input: {exc}")
+            ])
+            return False
+        finally:
+            msg.mm_pixel_values = None
+            msg.mm_grid_thw = None
+        return True
+
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
         batch = (
@@ -870,7 +907,19 @@ class Scheduler(SchedulerIOMixin):
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
-        batch.input_ids = self.token_pool[input_mapping]
+        # input_mapping's column leg is batch.positions, which mm requests shift by
+        # mm_rope_delta for RoPE; the token-pool gather must index the UNshifted
+        # [cached_len, device_len) span the prefill writer used, or it reads
+        # past-the-row garbage (only mm reqs have delta != 0).
+        if any(getattr(r, "mm_rope_delta", 0) for r in batch.padded_reqs):
+            rows = input_mapping[0]
+            cols = torch.cat([
+                torch.arange(r.cached_len, r.device_len, device=rows.device, dtype=rows.dtype)
+                for r in batch.padded_reqs
+            ])
+            batch.input_ids = self.token_pool[rows, cols]
+        else:
+            batch.input_ids = self.token_pool[input_mapping]
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
         forward_output = self.engine.forward_batch(batch, sample_args)

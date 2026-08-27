@@ -52,5 +52,10 @@ for them; other checkpoints of the same architectures work too.
   dropped from the FTW build). Qwen image input follows the offline
   `LLM.generate(mm_inputs=[{"pixel_values": ..., "grid_thw": ...}])` contract --
   token-id prompts with `image_token_id` placeholders; interleaved-mRoPE rows are
-  built automatically. The online server remains text-only (as for gemma4). Video
+  built automatically. Qwen3.5/3.6/3.8 additionally accept images through the
+  ONLINE API: `image_url` content parts (data: or http(s) URLs) on
+  `/v1/chat/completions` and Anthropic `image` blocks on `/v1/messages`, when the
+  server runs with `FREETOKEN_LOAD_VISION=1` and the `freetoken[vision]` extra
+  (pillow + torchvision) is installed -- the tokenizer worker preprocesses and the
+  scheduler encodes with the resident tower. Gemma-4 remains offline-only. Video
   spans are not supported yet.

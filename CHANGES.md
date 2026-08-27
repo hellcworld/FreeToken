@@ -65,10 +65,16 @@ RadixArk/Qwen3.8-27B-NVFP4 发射清单逐键/逐形状/逐 dtype 一致(1173 �
 
 ## 已知边界 / Known limitations
 
-- 本 fork 的验证全部在 CPU 加载器层 + 数值对齐完成(开发机无 NVIDIA GPU);
-  **GPU 端到端 `ft serve` 冒烟(≥24GB 显存)尚未执行**,稠密 27B NVFP4 需约
-  22GB 显存全量驻留
-- 在线 OpenAI/Anthropic server 的图像输入(image_url)未实现(gemma4 亦无)
+- `RadixArk/Qwen3.8-27B-NVFP4` 已在 Alibaba Cloud Linux 4 LTS 的 NVIDIA A10
+  24GB、驱动 r580.126.09、CUDA 13.0 上完成端到端 `ft serve` 冒烟。该 dense 27B
+  checkpoint 需 `--memory-ratio 0.95 --max-running-requests 1 --kv-reserve-tokens 512`：
+  实测约 23.2GB / 24GB 显存、约 28K 有效上下文，仅支持单并发
+- 在线 OpenAI/Anthropic server 的图像输入已实现(Qwen3.5/3.6/3.8;gemma4 仍离线):
+  需 `FREETOKEN_LOAD_VISION=1` + `freetoken[vision]` extra;tokenizer worker 做
+  HF processor 预处理,调度器用常驻视觉塔编码;单请求至多 4 张图。同时修复了
+  离线 mm 路径在真实 GPU 上的一串缺陷(dtype/device 错位、meta inv_freq、
+  token-pool gather 被 rope delta 偏移等)——离线 `LLM.generate(mm_inputs=...)`
+  与在线 API 现均已在 RTX 3060 12GB + WSL2 实机验证
 - 视频输入(时间戳拆帧)未实现;MTP 投机解码权重仍按上游丢弃
 - 上游相关 issue:#139 / #67 / #106(Qwen3.8-27B)、#79(多模态路线图)
 

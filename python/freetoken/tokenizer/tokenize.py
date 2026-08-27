@@ -19,6 +19,13 @@ from .effort import (
     probe_thinking_profile,
     quantize_effort,
 )
+from .multimodal import (
+    MAX_IMAGES_PER_REQUEST,
+    expand_image_pad_ids,
+    extract_image_parts,
+    is_image_part,
+    load_image_from_url,
+)
 
 logger = init_logger(__name__)
 
@@ -54,25 +61,109 @@ class TokenizeManager:
         self._thinking_profile: ThinkingProfile | None = None
         self._effort_lock = threading.Lock()
         self._logged_effort_maps: set[tuple[Any, str | None]] = set()
+        self._processor: Any | None = None
+        self._processor_lock = threading.Lock()
 
     def tokenize(self, msgs: List[TokenizeMsg]) -> List[torch.Tensor]:
         results: List[torch.Tensor] = []
         # TODO: batch tokenization
         for msg in msgs:
-            prompt = self.render_prompt(msg)
-            # A jinja chat template owns every special token (HF's apply_chat_template
-            # tokenizes with add_special_tokens=False for the same reason): tokenizers
-            # that auto-add bos (muse-glimmer's, llama's) would otherwise double it --
-            # the template already rendered one. Raw-string prompts and the dsv4
-            # encoder path keep the default.
-            templated = isinstance(msg.text, list) and self._dsv4_encoder is None
-            input_ids: torch.Tensor = (  # type: ignore
-                self.tokenizer.encode(
-                    prompt, return_tensors="pt", add_special_tokens=not templated
-                )
-            )
-            results.append(input_ids.view(-1).to(torch.int32))
+            input_ids, _, _ = self.tokenize_with_mm(msg)
+            results.append(input_ids)
         return results
+
+    def tokenize_with_mm(
+        self, msg: TokenizeMsg
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """Tokenize one message; for image-bearing prompts additionally return
+        the processor's CPU ``pixel_values`` and ``grid_thw`` for the scheduler
+        to encode with the resident vision tower (online multimodal path)."""
+        if not (isinstance(msg.text, list) and self._has_image_parts(msg.text)):
+            return self._tokenize_text(msg), None, None
+        if self._dsv4_encoder is not None:
+            raise ValueError("image inputs are not supported for this checkpoint")
+        if len(msg.text) > 0:
+            normalized, urls = extract_image_parts(msg.text)
+        else:
+            normalized, urls = msg.text, []
+        if len(urls) > MAX_IMAGES_PER_REQUEST:
+            raise ValueError(
+                f"a request may carry at most {MAX_IMAGES_PER_REQUEST} images"
+            )
+        processor = self._get_processor()
+        images = [load_image_from_url(u) for u in urls]
+        prep = processor(
+            text=["placeholder"] * len(images), images=images, return_tensors="pt"
+        )
+        grid = prep.get("image_grid_thw", prep.get("grid_thw"))
+        if grid is None:
+            raise ValueError("the image processor returned no image grid")
+        prompt = self._render(
+            normalized, msg.tools, self._sanitize_effort(msg.chat_template_kwargs or {})
+        )
+        ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+        expanded = expand_image_pad_ids(
+            ids, grid.tolist(), self._image_token_id()
+        )
+        input_ids = torch.tensor(expanded, dtype=torch.int32)
+        return input_ids, prep["pixel_values"], grid
+
+    def _tokenize_text(self, msg: TokenizeMsg) -> torch.Tensor:
+        prompt = self.render_prompt(msg)
+        # A jinja chat template owns every special token (HF's apply_chat_template
+        # tokenizes with add_special_tokens=False for the same reason): tokenizers
+        # that auto-add bos (muse-glimmer's, llama's) would otherwise double it --
+        # the template already rendered one. Raw-string prompts and the dsv4
+        # encoder path keep the default.
+        templated = isinstance(msg.text, list) and self._dsv4_encoder is None
+        input_ids: torch.Tensor = (  # type: ignore
+            self.tokenizer.encode(
+                prompt, return_tensors="pt", add_special_tokens=not templated
+            )
+        )
+        return input_ids.view(-1).to(torch.int32)
+
+    @staticmethod
+    def _has_image_parts(messages: list[dict[str, Any]]) -> bool:
+        for message in messages:
+            content = message.get("content")
+            if isinstance(content, list) and any(is_image_part(p) for p in content):
+                return True
+        return False
+
+    def _get_processor(self) -> Any:
+        """The HF processor of the served checkpoint, loaded lazily so text-only
+        deployments never pay for it. Gated on FREETOKEN_LOAD_VISION matching
+        the engine-side vision tower switch."""
+        from freetoken.models.config import vision_load_enabled
+
+        with self._processor_lock:
+            if self._processor is None:
+                if not vision_load_enabled():
+                    raise ValueError(
+                        "image inputs require the server to run with "
+                        "FREETOKEN_LOAD_VISION=1"
+                    )
+                from transformers import AutoProcessor
+
+                model_path = (
+                    getattr(self.tokenizer, "name_or_path", None)
+                    or getattr(self.tokenizer, "_name_or_path", "")
+                    or ""
+                )
+                if not str(model_path):
+                    raise ValueError("cannot locate the checkpoint for its image processor")
+                self._processor = AutoProcessor.from_pretrained(str(model_path))
+            return self._processor
+
+    def _image_token_id(self) -> int:
+        token_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        if token_id is None or token_id < 0:
+            raise ValueError(
+                "the tokenizer has no <|image_pad|> token; this checkpoint "
+                "does not support image inputs"
+            )
+        return int(token_id)
 
     def render_prompt(self, msg: TokenizeMsg) -> str:
         """The template/encoder half of ``tokenize``, exposed so the frontend can

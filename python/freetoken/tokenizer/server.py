@@ -84,18 +84,22 @@ def _tokenize_requests(
     tokenize_manager: Any,
     messages: List[TokenizeMsg],
     logger: Any,
-) -> tuple[List[TokenizeMsg], List[torch.Tensor], List[UserReply]]:
+) -> tuple[List[TokenizeMsg], List[torch.Tensor], List[UserReply], List[Any], List[Any]]:
     """Tokenize independently, returning backend work plus terminal frontend errors.
 
     Successful tokenization deliberately emits no prompt-token reply: accounting starts
-    only when the scheduler later confirms first-prefill admission.
+    only when the scheduler later confirms first-prefill admission. Image-bearing
+    prompts additionally yield (pixel_values, grid_thw) CPU payloads aligned with the
+    ok_msgs/ok_tensors lists (None entries for text-only requests).
     """
     ok_msgs: List[TokenizeMsg] = []
     ok_tensors: List[torch.Tensor] = []
+    ok_mm_pixels: List[Any] = []
+    ok_mm_grids: List[Any] = []
     errors: List[UserReply] = []
     for msg in messages:
         try:
-            tokens = tokenize_manager.tokenize([msg])[0]
+            tokens, mm_pixels, mm_grid = tokenize_manager.tokenize_with_mm(msg)
         except Exception as exc:  # noqa: BLE001 — isolate, never crash the worker
             logger.warning(f"tokenization failed for request {msg.uid}: {exc!r}")
             errors.append(
@@ -121,7 +125,9 @@ def _tokenize_requests(
             continue
         ok_msgs.append(msg)
         ok_tensors.append(tokens)
-    return ok_msgs, ok_tensors, errors
+        ok_mm_pixels.append(mm_pixels)
+        ok_mm_grids.append(mm_grid)
+    return ok_msgs, ok_tensors, errors, ok_mm_pixels, ok_mm_grids
 
 
 @torch.inference_mode()
@@ -245,7 +251,7 @@ def tokenize_worker(
                 # Tokenize per-message so a single un-renderable request (e.g. a chat template
                 # that rejects the message layout) becomes a terminal error reply for THAT uid
                 # instead of an uncaught exception that kills the worker and bricks the server.
-                ok_msgs, ok_tensors, errors = _tokenize_requests(
+                ok_msgs, ok_tensors, errors, ok_mm_pixels, ok_mm_grids = _tokenize_requests(
                     tokenize_manager, tokenize_msg, logger
                 )
                 if errors:
@@ -254,8 +260,16 @@ def tokenize_worker(
                     )
                 if ok_msgs:
                     backend = [
-                        UserMsg(uid=msg.uid, input_ids=t, sampling_params=msg.sampling_params)
-                        for msg, t in zip(ok_msgs, ok_tensors, strict=True)
+                        UserMsg(
+                            uid=msg.uid,
+                            input_ids=t,
+                            sampling_params=msg.sampling_params,
+                            mm_pixel_values=px,
+                            mm_grid_thw=gr,
+                        )
+                        for msg, t, px, gr in zip(
+                            ok_msgs, ok_tensors, ok_mm_pixels, ok_mm_grids, strict=True
+                        )
                     ]
                     send_backend.put(backend[0] if len(backend) == 1 else BatchBackendMsg(data=backend))
             if len(abort_msg) > 0:

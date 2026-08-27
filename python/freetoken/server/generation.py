@@ -23,6 +23,7 @@ from typing import Any
 from . import request_ring
 from freetoken.core import SamplingParams
 from freetoken.message import TokenizeMsg
+from freetoken.tokenizer.multimodal import is_image_part
 from freetoken.tokenizer.tokenize import resolve_thinking_mode
 
 try:
@@ -189,8 +190,10 @@ def resolve_sampling(
 
 def render_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Normalize OpenAI-shaped message dicts for the chat template: flatten text
-    content parts to a string and decode tool-call arguments from JSON. Raises
-    ValueError on a non-text content part (text-only server). Shared by all adapters."""
+    content parts to a string and decode tool-call arguments from JSON. Content
+    lists carrying images keep their list form (image parts normalized to the
+    template convention, raw url preserved for the tokenizer worker); a request
+    that reaches a text-only deployment fails per-request there. Shared by all adapters."""
     return [_render_message(m) for m in messages]
 
 
@@ -198,7 +201,10 @@ def _render_message(message: dict[str, Any]) -> dict[str, Any]:
     m = dict(message)
     content = m.get("content")
     if isinstance(content, list):
-        m["content"] = _flatten_text_parts(content)
+        if any(is_image_part(p) for p in content):
+            m["content"] = _normalize_parts_with_images(content)
+        else:
+            m["content"] = _flatten_text_parts(content)
     # Templates read different reasoning keys (reasoning_content: most; reasoning:
     # gemma4; thinking: gpt-oss) — accept any, emit both.
     reasoning = m.get("reasoning_content") or m.get("reasoning") or m.get("thinking")
@@ -239,6 +245,26 @@ def _flatten_text_parts(parts: list[Any]) -> str:
         else:
             raise ValueError(f"Unsupported content part type for text-only server: {ptype}")
     return "".join(texts)
+
+
+def _normalize_parts_with_images(parts: list[Any]) -> list[dict[str, Any]]:
+    """Keep the content list for a jinja template that renders image parts:
+    text parts explicit, ``image_url`` parts switched to the ``{"type": "image"}``
+    convention with the raw url kept inside for the tokenizer worker."""
+    out: list[dict[str, Any]] = []
+    for part in parts:
+        if isinstance(part, dict) and part.get("type") == "text":
+            out.append({"type": "text", "text": part.get("text") or ""})
+        elif is_image_part(part):
+            holder = part.get("image_url")
+            url = holder.get("url") if isinstance(holder, dict) else holder
+            if not url or not isinstance(url, str):
+                raise ValueError("image_url part is missing image_url.url")
+            out.append({"type": "image", "image_url": {"url": url}})
+        else:
+            ptype = part.get("type") if isinstance(part, dict) else None
+            raise ValueError(f"Unsupported content part type for text-only server: {ptype}")
+    return out
 
 
 def split_tool_lists(

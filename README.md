@@ -38,7 +38,7 @@ serves the unsloth mixed-precision layout natively (FP8 W8A16 attention + load-t
 re-quant of its FP8 MLP layers). Dense 27B NVFP4 keeps all weights GPU-resident: budget
 ~22 GB VRAM.
 
-**2 · Vision input for Qwen3.5/3.6/3.8 (gemma4-parity)**
+**2 · Vision input for Qwen3.5/3.6/3.8 (offline + online)**
 
 ```python
 llm = LLM(model="...", ...)          # serve with FREETOKEN_LOAD_VISION=1
@@ -52,8 +52,17 @@ The tower/merger are bit-faithful vs the transformers reference; interleaved-mRo
 positions are built automatically from `grid_thw`. Text-only builds are bit-identical
 to upstream. FTW conversion must also run with `FREETOKEN_LOAD_VISION=1`.
 
-**Verification experiments** (CPU loader-level + numerical alignment; the dev host has
-no NVIDIA GPU -- GPU end-to-end serve smoke on a ≥24 GB card is the remaining step):
+The same checkpoints accept images through the **online API** — OpenAI
+`image_url` content parts (data: or http(s) URLs) on `/v1/chat/completions` and
+Anthropic `image` blocks on `/v1/messages` — when the server runs with
+`FREETOKEN_LOAD_VISION=1` and the `freetoken[vision]` extra (pillow +
+torchvision) is installed: the tokenizer worker preprocesses images with the
+checkpoint's HF processor, and the scheduler encodes them with the resident
+vision tower (up to 4 images per request).
+
+**Verification experiments** (CPU loader-level + numerical alignment; plus an
+end-to-end `ft serve` smoke test of `RadixArk/Qwen3.8-27B-NVFP4` on an NVIDIA
+A10 24 GB GPU with CUDA 13):
 
 | Experiment 1 -- real-checkpoint loading | Experiment 2 -- numerical alignment |
 |---|---|

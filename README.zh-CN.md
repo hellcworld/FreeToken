@@ -52,8 +52,8 @@ out = llm.generate(
 视觉塔/merger 与 transformers 参考实现逐位对齐;交错 mRoPE 位置由 `grid_thw`
 自动构建;纯文本构建与上游逐位一致。FTW 转换同样须带 `FREETOKEN_LOAD_VISION=1`。
 
-**验证实验**(CPU 加载器级 + 数值对齐;开发机无 NVIDIA GPU——≥24GB 显存上的
-GPU 端到端 serve 冒烟是剩余步骤):
+**验证实验**(CPU 加载器级 + 数值对齐;另已在 NVIDIA A10 24GB / CUDA 13 上完成
+`RadixArk/Qwen3.8-27B-NVFP4` 的端到端 `ft serve` 冒烟):
 
 | 实验一——真实检查点加载 | 实验二——数值对齐 |
 |---|---|
@@ -94,14 +94,106 @@ uv venv && source .venv/bin/activate
 uv pip install -e ".[accel]"
 ```
 
+### 阿里云 A10 快速运行
+
+已在 Alibaba Cloud Linux 4 LTS 的 NVIDIA A10 24GB、驱动 r580.126.09、CUDA 13.0
+上验证。系统需为 Linux x86_64，建议预留至少 30GB 磁盘空间用于 Python 环境和
+Hugging Face 模型缓存。阿里云预装 GPU 驱动、CUDA 和 FreeToken 的镜像可直接从
+依赖检查开始。
+
+```bash
+nvidia-smi
+
+# 该实测镜像在 FlashInfer JIT 回退时缺少 ninja。
+/opt/FreeToken/.venv/bin/pip install ninja
+```
+
+如需从源码安装：
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source "$HOME/.local/bin/env"
+
+git clone https://github.com/hellcworld/FreeToken.git /data/FreeToken
+cd /data/FreeToken
+git checkout feat/qwen-vision
+bash install.sh --yes
+```
+
+模型可由 `ft serve` 首次启动时自动下载。也可预下载到 Hugging Face 缓存：
+
+```bash
+/opt/FreeToken/.venv/bin/huggingface-cli download RadixArk/Qwen3.8-27B-NVFP4
+```
+
+模型约 21GB，默认缓存路径为
+`~/.cache/huggingface/hub/models--RadixArk--Qwen3.8-27B-NVFP4`。启动已验证的
+modelopt checkpoint：
+
+```bash
+cd /opt/FreeToken
+nohup .venv/bin/ft serve \
+  --model RadixArk/Qwen3.8-27B-NVFP4 \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --memory-ratio 0.95 \
+  --max-running-requests 1 \
+  --kv-reserve-tokens 512 \
+  > /tmp/ft_serve.log 2>&1 &
+```
+
+这组参数是 A10 24GB 上该 dense 27B checkpoint 的实测配置：`--memory-ratio 0.95`
+最大化 KV 可用显存，`--max-running-requests 1` 限制为单并发，
+`--kv-reserve-tokens 512` 缩小默认 KV 预留。无需添加 `--moe-backend offload`，
+该模型为 dense 架构，MoE 参数不会生效。
+
+服务初始化约需 2--3 分钟：权重加载约 5 秒、KV cache 分配约 40 秒、CUDA Graph
+捕获约 80 秒。在 ready 前 API 返回 HTTP 503 属正常现象。使用以下命令等待就绪：
+
+```bash
+tail -f /tmp/ft_serve.log
+
+# 就绪日志：API server is ready to serve on 0.0.0.0:8000
+curl -s http://127.0.0.1:8000/v1/models | grep Qwen3.8
+```
+
+服务就绪后验证推理：
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "Qwen3.8-27B-NVFP4",
+    "messages": [{"role": "user", "content": "你好"}],
+    "max_tokens": 64
+  }'
+```
+
+运行限制与排障：
+
+- 实测模型权重约占 21.5GB、KV cache 约占 1.73GB、CUDA Graph 约占 0.02GB，总计约
+  23.2GB / 24GB，余量约 0.89GB。最大上下文配置为 262144 tokens，但受 KV cache
+  限制，实际可用约 28K tokens。
+- `Not enough memory for KV cache`：保持单并发，并降低 `--kv-reserve-tokens`；A10
+  24GB 上不应提高并发。
+- `FileNotFoundError: ninja`：在服务的 Python 环境执行
+  `/opt/FreeToken/.venv/bin/pip install ninja`。
+- `model is still loading` / HTTP 503：CUDA Graph 捕获尚未结束，等待 1--2 分钟。
+- 公网访问需在 ECS 安全组放行入方向 TCP `8000`，并将源 CIDR 限制为实际客户端 IP。
+- `unsloth/Qwen3.8-27B-NVFP4` 可作为 compressed-tensors 混合精度方言的备选模型。
+  需要更高并发或更长上下文时，应使用显存更大的 GPU 或更小的模型。
+- `FREETOKEN_LOAD_VISION=1` 用于离线 Python `LLM.generate`、FTW 转换，以及在线
+  API 的图像输入（见下）；需配合 `freetoken[vision]` extra（pillow + torchvision）。
+
 本 fork 新增能力的使用要点:
 
 - **Qwen3.8-27B**:直接 `ft serve --model <checkpoint>` 即可,支持
   [RadixArk/Qwen3.8-27B-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4)(modelopt)与
   [unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4)(compressed-tensors)两种方言
-- **视觉输入**:`FREETOKEN_LOAD_VISION=1` 开启(FTW 转换同样需要该变量);离线
-  `LLM.generate(mm_inputs=[{"pixel_values": ..., "grid_thw": ...}])` 传入图像,
-  在线 server 暂为纯文本(与 gemma4 现状一致)
+- **视觉输入**:`FREETOKEN_LOAD_VISION=1` 开启(FTW 转换同样需要该变量)。离线走
+  `LLM.generate(mm_inputs=[{"pixel_values": ..., "grid_thw": ...}])`;在线 API 支持
+  OpenAI 格式的 `image_url` 内容部件(data: 或 http(s) URL)与 Anthropic 的 `image`
+  块——tokenizer worker 做图像预处理,调度器进程用常驻视觉塔编码(单请求至多 4 张图)
 
 更多细节:
 
