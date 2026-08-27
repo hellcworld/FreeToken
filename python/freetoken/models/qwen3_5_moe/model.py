@@ -149,6 +149,11 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
         order (tower patches are concatenated per image; the merger's 2x2 merge keeps
         that order). ``image_position_ids`` is the gemma4-style argument and unused."""
         assert grid_thw is not None, "qwen3_5 encode_images needs processor grid_thw"
+        # HF processors hand back fp32 CPU pixels; the tower weights are
+        # model-dtype on device
+        weight = self.vision_tower.patch_embed.proj.weight
+        pixel_values = pixel_values.to(device=weight.device, dtype=weight.dtype)
+        grid_thw = grid_thw.to(device=weight.device)
         features = self.vision_tower.forward(pixel_values, grid_thw)
         return self.embed_vision.forward(features)
 

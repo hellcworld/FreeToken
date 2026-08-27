@@ -73,7 +73,7 @@ def vision_position_ids(grid_thw: torch.Tensor, spatial_merge_size: int) -> torc
         hpos = hpos.reshape(block_shape).transpose(1, 2).flatten()
         wpos = wpos.reshape(block_shape).transpose(1, 2).flatten()
         out.append(torch.stack((hpos, wpos), dim=-1).repeat(t, 1))
-    return torch.cat(out, dim=0)
+    return torch.cat(out, dim=0).to(grid_thw.device)
 
 
 def vision_cu_seqlens(grid_thw: torch.Tensor) -> torch.Tensor:
@@ -94,7 +94,7 @@ def pos_embed_interp(grid_thw: torch.Tensor, num_grid_per_side: int,
     heights = torch.repeat_interleave(grid_thw[:, 1], counts)
     widths = torch.repeat_interleave(grid_thw[:, 2], counts)
     starts = torch.repeat_interleave(F.pad(counts.cumsum(0)[:-1], (1, 0)), counts)
-    within = (torch.arange(int(counts.sum())) - starts) % (heights * widths)
+    within = (torch.arange(int(counts.sum()), device=starts.device) - starts) % (heights * widths)
     blocks_w = widths // merge
     in_col = within % merge
     in_row = (within // merge) % merge
@@ -106,8 +106,8 @@ def pos_embed_interp(grid_thw: torch.Tensor, num_grid_per_side: int,
     def _axis(index: torch.Tensor, size: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         src = index.to(torch.float32) * (side - 1) / torch.clamp(size - 1, min=1)
         floor = torch.floor(src)
-        taps = (floor.long().unsqueeze(-1) + torch.arange(2)).clamp(0, side - 1)
-        dist = (src.unsqueeze(-1) - floor.unsqueeze(-1) - torch.arange(2)).abs()
+        taps = (floor.long().unsqueeze(-1) + torch.arange(2, device=index.device)).clamp(0, side - 1)
+        dist = (src.unsqueeze(-1) - floor.unsqueeze(-1) - torch.arange(2, device=index.device)).abs()
         return taps, (1 - dist).clamp(min=0)
 
     h_taps, h_w = _axis(row, heights)
@@ -126,11 +126,21 @@ class _VisionRotary:
         self.inv_freq = 1.0 / (
             base ** (torch.arange(0, half_dim, 2, dtype=torch.float32) / half_dim)
         )
+        # the model is built under a meta-device context, which leaves this
+        # computed constant dataless; recompute lazily on first real use
+        self._base = base
+        self._half_dim = half_dim
 
     def __call__(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.inv_freq.is_meta:
+            self.inv_freq = 1.0 / (
+                self._base ** (torch.arange(
+                    0, self._half_dim, 2, dtype=torch.float32, device=position_ids.device
+                ) / self._half_dim)
+            )
         freqs = torch.cat(
-            [position_ids[:, 0:1].float() * self.inv_freq,
-             position_ids[:, 1:2].float() * self.inv_freq],
+            [position_ids[:, 0:1].float() * self.inv_freq.to(position_ids.device),
+             position_ids[:, 1:2].float() * self.inv_freq.to(position_ids.device)],
             dim=-1,
         )
         emb = torch.cat((freqs, freqs), dim=-1)
@@ -269,6 +279,7 @@ def apply_interleaved_mrope(
     frequency slot i of the merged row takes axis i%3 (sections [T, H, W], frequencies
     continuous). Text tokens carry three equal rows, which degenerates to plain partial
     rope. fp32 math, cast back on return."""
+    mm_positions = mm_positions.to(inv_freq.device)
     freqs = mm_positions.float().unsqueeze(-1) * inv_freq  # [3, N, 32]
     merged = freqs[0].clone()
     for axis, offset in ((1, 1), (2, 2)):

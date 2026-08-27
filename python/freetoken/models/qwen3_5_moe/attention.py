@@ -72,6 +72,9 @@ class Qwen3_5Attention(BaseOP):
                 config.rotary_config.base
                 ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
             )
+            # meta-device model init leaves this constant dataless; recompute on use
+            self._mrope_base = config.rotary_config.base
+            self._mrope_dim = dim
 
     def _project(self, x: torch.Tensor):
         """Returns (q, k, v, gate): q [N, num_q, head_dim] post qk-norm+rope,
@@ -89,9 +92,19 @@ class Qwen3_5Attention(BaseOP):
         k = self.k_norm.forward(k).reshape(-1, self.kv_attn_dim)
         mm_positions = getattr(batch, "mm_positions", None)
         if mm_positions is not None:
-            q, k = apply_interleaved_mrope(
-                mm_positions, self._mrope_inv_freq, self._mrope_section, q, k
-            )
+            inv_freq = self._mrope_inv_freq
+            if inv_freq.is_meta:
+                inv_freq = self._mrope_inv_freq = 1.0 / (
+                    self._mrope_base ** (torch.arange(
+                        0, self._mrope_dim, 2, dtype=torch.float32, device=q.device
+                    ) / self._mrope_dim)
+                )
+            # apply_interleaved_mrope is written for [N, heads, head_dim]; q/k are
+            # flat [N, heads*head_dim] here -- view up and flatten back after
+            q3 = q.view(-1, self.num_q, self.head_dim)
+            k3 = k.view(-1, self.kv_attn_dim // self.head_dim, self.head_dim)
+            q3, k3 = apply_interleaved_mrope(mm_positions, inv_freq, self._mrope_section, q3, k3)
+            q, k = q3.reshape(q.shape), k3.reshape(k.shape)
         else:
             q, k = self.rotary.forward(positions, q, k)
         return q.view(-1, self.num_q, self.head_dim), k, v, gate
