@@ -62,9 +62,14 @@ class TestExtractImageParts:
             ])
 
     def test_other_part_types_still_rejected(self):
+        # an unknown part type inside an image-bearing message is rejected here;
+        # in an image-free message the frontend's flatten path rejects it instead
         with pytest.raises(ValueError, match="Unsupported content part"):
             extract_image_parts([
-                {"role": "user", "content": [{"type": "audio_url", "audio_url": {}}]},
+                {"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+                    {"type": "audio_url", "audio_url": {}},
+                ]},
             ])
 
     def test_is_image_part(self):
@@ -99,7 +104,7 @@ class TestExpandImagePadIds:
 
     def test_embeds_from_grid(self):
         assert embeds_from_grid([1, 30, 40], 2) == 300
-        assert embeds_from_grid([2, 8, 8], 2) == 64
+        assert embeds_from_grid([2, 8, 8], 2) == 32
 
 
 class TestTensor2DSerialization:
