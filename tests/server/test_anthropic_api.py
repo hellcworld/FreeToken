@@ -921,8 +921,13 @@ def test_json_safe_validation_errors_scrubs_bytes():
             ]
 
     out = _json_safe_validation_errors(_Exc())
-    assert out[0]["input"] == "raw \ufffd\ufffd bytes"
-    assert out[0]["ctx"]["error"] == "\ufffd\ufffd"
-    assert out[0]["ctx"]["nested"] == ["\ufffd", {"k": ["\ufffd", 1]}]
+    # \xd6\xbb (GBK "只") happens to be a valid 2-byte UTF-8 sequence (U+05BB), so
+    # compute expectations the same way the scrubber does instead of hardcoding.
+    assert out[0]["input"] == b"raw \xd6\xbb bytes".decode("utf-8", "replace")
+    assert out[0]["ctx"]["error"] == b"\xd6\xbb".decode("utf-8", "replace")
+    assert out[0]["ctx"]["nested"] == [
+        b"\xff".decode("utf-8", "replace"),
+        {"k": [b"\xfe".decode("utf-8", "replace"), 1]},
+    ]
     assert out[0]["loc"] == ["body", 21]
     json.dumps(out)  # fully JSON-serializable
