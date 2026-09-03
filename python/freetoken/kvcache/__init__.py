@@ -70,9 +70,25 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
     """Build the engine's KV pool for ``num_pages`` USABLE pages (the dummy page and every
     secondary tier -- window pool, index slab, state rings -- are derived here or inside
     the pool). Single factory entry for all pool families, DSV4 included."""
+    from .base import resolve_kv_dtype
     from .dsv4_cost_model import _dsv4_pool_sizes
     from .hybrid_swa_pool import _naive_swa_num_tokens, _swa_paged_num_tokens
     from .dsv4_paged_pool import DSV4PagedKVCache
+
+    # An overriding paged-KV dtype (--kv-cache-dtype fp8_e4m3) applies to the plain MHA
+    # family only; Engine._adjust_config rejects every other family up front, and this
+    # re-check keeps a programmatic config that skipped the gate from undercounting or
+    # mis-allocating a pool that cannot dequantize.
+    kv_dtype = resolve_kv_dtype(config)
+    if kv_dtype is not None:
+        from .mha_pool import MHAKVCache
+
+        if resolve_pool_class(config.model_config) is not MHAKVCache:
+            raise ValueError(
+                f"--kv-cache-dtype {getattr(config, 'kv_cache_dtype', '?')!r} applies to "
+                "the plain MHA/GQA pool only; this model routes to another pool family."
+            )
+        dtype = kv_dtype
 
     model_config = config.model_config
     if resolve_pool_class(model_config) is DSV4PagedKVCache:

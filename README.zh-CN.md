@@ -27,7 +27,7 @@
 
 ## ✨ 本 Fork 新增能力
 
-在上游 `main@2757bb5` 之上叠加两个功能(详情与验证:[CHANGES.md](CHANGES.md)):
+在上游 `main@2757bb5` 之上叠加三个功能(详情与验证:[CHANGES.md](CHANGES.md)):
 
 **1 · Qwen3.8-27B NVFP4 支持——两种量化方言**
 
@@ -62,6 +62,16 @@ out = llm.generate(
 | 实验三——CPU 测试套件(15 项全部通过) |
 |---|
 | ![exp3](assets/fork/exp3_tests.png) |
+
+**3 · FP8 KV cache(`--kv-cache-dtype fp8_e4m3`,上游 issue #280)**
+
+```bash
+ft serve --model Qwen/Qwen3.5-35B-A3B --kv-cache-dtype fp8_e4m3   # KV 容量约 1.9 倍
+```
+分页 K/V 以 e4m3 存储,逐 (token, head) 动态 FP32 scale,在 Triton attention
+kernel 内反量化(写入侧单步 RNE 量化;读取侧 bf16 dot + fp32 累加,量化是
+唯一误差源,近无损)。需 CUDA + bfloat16 + Triton 后端 + 纯 MHA/GQA 模型,
+其余组合在启动时直接报错。
 
 ## 简介
 

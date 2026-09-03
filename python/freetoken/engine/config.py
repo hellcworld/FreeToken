@@ -18,6 +18,11 @@ class EngineConfig:
     model_path: str
     tp_info: DistributedInfo
     dtype: torch.dtype
+    # Paged-KV storage dtype (--kv-cache-dtype): "auto" follows the global dtype;
+    # "fp8_e4m3" stores K/V as e4m3 with per-(token, head) FP32 dynamic scales,
+    # dequantized inside the Triton attention kernels (~1.9x KV capacity).
+    # Validated/resolved in Engine._adjust_config; see kvcache.base.resolve_kv_dtype.
+    kv_cache_dtype: str = "auto"
     max_running_req: int = 4
     attention_backend: str = "auto"
     moe_backend: str = "auto"

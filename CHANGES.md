@@ -55,6 +55,52 @@ RadixArk/Qwen3.8-27B-NVFP4 发射清单逐键/逐形状/逐 dtype 一致(1173 �
 **验证**:5 个新单测全绿;旧量化测试回归干净;真实检查点(RadixArk)
 视觉开启后发射 1173 文本 + 333 视觉张量、零错误。
 
+## 三、fp8 KV cache(`--kv-cache-dtype fp8_e4m3`,对应上游 issue #280)
+
+opt-in 的 FP8 分页 KV 缓存:K/V 以 e4m3 存储,逐 (token, head) 动态 FP32
+scale,在 Triton attention kernel 内反量化(解码 + scale 后仍走 bf16 dot +
+fp32 累加)。GQA 模型(head_dim=128)KV 容量约 **1.94x**(4096 → 2112
+字节/token/层,含 3% scale 开销);精度上量化是唯一误差源——单步 RNE 舍入,
+逐元素相对误差 ≤ 6.25%(e4m3 格式上限),softmax 加权平均进一步压缩,
+近无损。
+
+- **写入路径**(`kvcache/mha_pool.py`):`store_kv` 逐 (token, head) 行
+  amax → scale = amax/448,RNE 量化后复用现有 CUDA `store_cache`
+  逐行拷贝;scale slab 随 `index_copy_` 写入。量化原语复用已在 H100 上
+  位精确验证过的 e4m3 语义(权重 fp8 同一套)。
+- **读取路径**(`kernel/triton/attention.py`):decode/extend/fallback 三个
+  kernel 的缓存读取循环加 `KV_FP8` 分支,以 uint8 视图装载(单一代码路径,
+  native/emulated 一致),`e4m3_u8_to_f32` 精确解码 × scale 反量化。
+- **配置与校验**(`--kv-cache-dtype`):仅 CUDA + 全局 bfloat16 + Triton
+  后端 + 纯 MHA/GQA 模型(排除 MLA/DSA/SWA/DSV4/BSA);开启后 auto 后端
+  解析将 triton 提到首位(sm90 上不再默认 fa,fi),显式指定封闭厂商后端
+  (fa/fi/trtllm)直接报错。内存核算(`spec_kv_bytes_per_token`)自动计入
+  fp8 与 scale 字节。
+
+使用:`ft serve --model ... --kv-cache-dtype fp8_e4m3`(显式
+`--attention-backend triton` 可省略,auto 会解析到)。
+
+**实测数据**(RTX 3060 12GB,`nvidia/Qwen3.6-35B-A3B-NVFP4` 端到端):
+
+- **精度**:量化往返逐元素相对误差实测 ≤0.059(e4m3 格式上限 6.25%;
+  bf16 为 ~0.4%),可精确表示的值零误差;kernel 输出对"反量化精确参考"
+  偏差 ≤2e-2(纯累加顺序差异),对 bf16 原值参考 ≤1e-1 且 768 元素中仅
+  1 个超出 5%——量化噪声被 softmax 平均进一步压缩,近无损。
+- **显存(262K 上下文)**:bf16 KV = 5.00 GiB,fp8+scale = 2.54 GiB
+  (启动日志实测一致),省 2.46 GiB(-49%,比值 1.97x)。12GB 卡上 bf16
+  池只能按剩余显存缩到 ~131K token;**fp8 才能完整兑现该模型
+  `max_position_embeddings=262144` 的原生上下文**。
+- **端到端**:`--kv-cache-dtype fp8_e4m3` 冷启动 → auto 后端解析为
+  triton → fp8 池分配 262309 token = 2.54 GiB → CUDA 图捕获 + warmup
+  通过 → 真实补全正常返回。GDN 线性层的递归状态不经 KV 池,不受影响
+  (该模型仅 10/40 层进池;全注意力密集模型同参数收益绝对值 ×4)。
+
+**验证**:`tests/engine/test_kv_cache_dtype.py`(11 项配置矩阵,纯 CPU)、
+`tests/kvcache/test_fp8_kv_quant.py`(量化往返精度、逐行 scale、池 slab
+几何、内存核算,纯 CPU)、`tests/kernels/test_fp8_kv_attention.py`
+(CUDA-gated:store 逐字节一致性 + decode/extend/fallback 对"反量化参考"
+与"bf16 参考"双层容差比对)。
+
 ## 版本说明 / Versioning
 
 - 本 fork 标签:**`qwen38-vision-v1.0.0`**(见 git tag)

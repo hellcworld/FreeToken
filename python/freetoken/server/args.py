@@ -223,6 +223,22 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-cache-dtype",
+        type=str,
+        dest="kv_cache_dtype",
+        default=ServerArgs.kv_cache_dtype,
+        choices=["auto", "fp8_e4m3"],
+        help=(
+            "Paged-KV storage dtype. 'auto' (default) follows --dtype. 'fp8_e4m3' stores "
+            "K/V as e4m3 with per-(token, head) FP32 dynamic scales and dequantizes inside "
+            "the Triton attention kernels: ~1.9x KV capacity for a small quantization error "
+            "(near-lossless in practice). Requires CUDA, --dtype bfloat16, the Triton "
+            "attention backend, and a non-MLA/non-SWA/non-DSV4/non-BSA model; anything else "
+            "fails loudly at startup."
+        ),
+    )
+
+    parser.add_argument(
         "--tensor-parallel-size",
         "--tp-size",
         type=int,

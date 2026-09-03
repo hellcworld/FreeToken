@@ -69,6 +69,7 @@ ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefi
 |---|---|---|
 | `--memory-ratio` | 0.9 | Fraction of free VRAM the engine may use (weights + MoE cache + KV) |
 | `--num-pages` / `--num-tokens` | auto | KV capacity override in pages / tokens (mutually exclusive; auto sizes from VRAM left after weights and MoE cache) |
+| `--kv-cache-dtype` | auto | `fp8_e4m3` stores paged K/V as e4m3 with per-(token, head) FP32 dynamic scales, dequantized inside the Triton attention kernels: ~1.9x KV capacity, near-lossless accuracy (worst-case per-element error is the e4m3 half-ulp 6.25%, measured ≤6%; bf16 is ~0.4%). At 262K context this is 2.54 GiB vs bf16's 5.00 GiB. Requires CUDA, `--dtype bfloat16`, the Triton backend (auto resolves to it), and a plain MHA/GQA model (no MLA/DSA/SWA/DSV4/BSA; GDN-hybrid models quantize their full-attention layers); anything else fails loudly at startup |
 | `--page-size` | 1 | KV page size; DSV4 forces 128, the TRTLLM backend needs 16/32/64, SWA models require 1 |
 | `--cache-type` | radix | `radix` (prefix reuse; SWA/GDN-aware variants picked automatically) or `naive` |
 | `--attention-backend`, `--attn` | auto | `trtllm`/`fi`/`fa`/`triton`/`dsv4_sparse`/`dsa`; `prefill,decode` pair allowed; auto picks per model + GPU |

@@ -16,19 +16,69 @@ class CacheRebuildRejected(Exception):
     this is recoverable, unlike a failure after the free."""
 
 
+# --kv-cache-dtype values that override the global dtype for the paged-KV slabs.
+# "auto" (and anything else) resolves to None == follow config.dtype.
+KV_CACHE_DTYPE_MAP = {
+    "fp8_e4m3": torch.float8_e4m3fn,
+}
+
+
+def resolve_kv_dtype(config) -> torch.dtype | None:
+    """The paged-KV slab dtype overriding the global one, or None to follow it.
+
+    Pure name -> dtype mapping; the feasibility checks (backend, model family,
+    device, global dtype) live in Engine._adjust_config so both the CLI and the
+    programmatic EngineConfig path are covered."""
+    raw = getattr(config, "kv_cache_dtype", "auto") or "auto"
+    if raw == "auto":
+        return None
+    if raw not in KV_CACHE_DTYPE_MAP:
+        raise ValueError(
+            f"--kv-cache-dtype {raw!r}: unsupported (supported: "
+            f"{', '.join(['auto', *KV_CACHE_DTYPE_MAP])})"
+        )
+    return KV_CACHE_DTYPE_MAP[raw]
+
+
+def kv_elem_bytes(config) -> int:
+    """Bytes per paged-KV element: the overriding kv dtype's itemsize when one is
+    set (fp8 stores 1 byte/elem), else the global dtype's."""
+    kv_dtype = resolve_kv_dtype(config)
+    return config.dtype.itemsize if kv_dtype is None else kv_dtype.itemsize
+
+
+def kv_scale_bytes_per_token_per_layer(config) -> int:
+    """Per-token, per-layer bytes for the fp8-KV dynamic scales: one FP32 scale per
+    (token, head) per slab, times the two slabs. 0 unless an overriding kv dtype is
+    set (fp8 is the only one today; MLA latent groups store no separate scales --
+    they are rejected for fp8 KV at config time)."""
+    if resolve_kv_dtype(config) is None:
+        return 0
+    return 2 * 4
+
+
 def spec_kv_bytes_per_token(spec, config) -> int:
     """One paged-KV group's bytes per token: (1|2 slabs) x head_dim x local kv heads x dtype
     x layers, plus the bf16 DSA index-key slab when the spec carries indexer dims. Pure
     per-spec arithmetic -- pool families compose it over THEIR OWN groups; no family
     branching here. (2 bytes/elem == the torch.bfloat16 dsa_pool.DSAKVCache._alloc
-    hardcodes; keep the two in lockstep if the slab dtype ever changes.)"""
-    per_token = (
-        (1 if spec.mla else 2)  # MLA latent groups store one slab (V aliases K)
-        * spec.head_dim
-        * div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
-        * config.dtype.itemsize
-        * spec.num_layers
+    hardcodes; keep the two in lockstep if the slab dtype ever changes.) An overriding
+    kv-cache dtype (fp8) prices the slab at its own itemsize and adds the per-(token,
+    head) FP32 scale bytes; MLA latent groups never take fp8 (rejected at config time),
+    so the scale term is two-slab-only."""
+    local_heads = div_even(
+        spec.num_kv_heads, config.tp_info.size, allow_replicate=True
     )
+    kv_bytes = kv_elem_bytes(config)
+    if spec.mla:
+        # fp8 KV never applies to MLA latent groups (rejected at config time and the
+        # pool asserts bf16); always price the single slab at the global dtype so a
+        # programmatic config that skipped the gate cannot undercount.
+        kv_bytes = config.dtype.itemsize
+        per_token = spec.head_dim * local_heads * kv_bytes * spec.num_layers
+    else:
+        per_token = 2 * spec.head_dim * local_heads * kv_bytes * spec.num_layers
+        per_token += local_heads * kv_scale_bytes_per_token_per_layer(config) * spec.num_layers
     return per_token + spec.index_head_dim * spec.num_index_layers * 2
 
 
@@ -141,6 +191,15 @@ class BaseKVCachePool(ABC):
 
     @abstractmethod
     def v_cache(self, index: int) -> torch.Tensor: ...
+
+    def k_scale(self, index: int) -> torch.Tensor:
+        """Per-(token, head) FP32 K dequant scales; only pools storing quantized KV
+        (fp8 MHA today) implement this. The Triton backend reads it only when the
+        pool dtype is an overriding kv dtype."""
+        raise NotImplementedError(f"{type(self).__name__} stores no KV scales")
+
+    def v_scale(self, index: int) -> torch.Tensor:
+        raise NotImplementedError(f"{type(self).__name__} stores no KV scales")
 
     @abstractmethod
     def store_kv(

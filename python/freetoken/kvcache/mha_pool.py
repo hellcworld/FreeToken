@@ -8,6 +8,29 @@ from freetoken.utils import div_even
 
 from .base import BaseKVCachePool
 
+# e4m3's largest finite magnitude; the amax scale maps every row's |max| onto it.
+E4M3_MAX = 448.0
+
+
+def quantize_rows_e4m3(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize ``(tokens, kv_heads, head_dim)`` rows onto the e4m3 grid with one
+    dynamic FP32 amax scale per (token, head) row: the row's |max| maps to ``E4M3_MAX``
+    so every element sits in the format's sweet spot (per-tensor scales would waste
+    range on row-magnitude spread). Returns ``(fp8 rows, fp32 scales)``; the cast is
+    round-to-nearest-even, so exactly-representable values pass through unchanged and
+    the worst-case error is the e4m3 half-ulp, 2^-4 relative (bf16: 2^-9)."""
+    amax = x.abs().amax(dim=-1).float()
+    # all-zero rows (padding) would divide by zero -> NaN; a tiny scale keeps them 0.
+    scale = (amax / E4M3_MAX).clamp_min(torch.finfo(torch.float32).tiny)
+    q = (x.float() / scale.unsqueeze(-1)).clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn)
+    return q, scale
+
+
+def dequantize_rows_e4m3(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """The exact inverse of :func:`quantize_rows_e4m3` (up to the stored quantization
+    itself): fp8 -> fp32 is exact and the scale multiply is a single rounding."""
+    return q.to(torch.float32) * scale.unsqueeze(-1)
+
 
 class MHAKVCache(BaseKVCachePool):
     """
@@ -36,6 +59,10 @@ class MHAKVCache(BaseKVCachePool):
         tp_info = get_tp_info()
         local_kv_heads = div_even(num_kv_heads, tp_info.size, allow_replicate=True)
         self._num_layers = num_layers
+        # fp8 paged KV (--kv-cache-dtype fp8_e4m3): slabs hold e4m3 values, a parallel
+        # FP32 slab holds the per-(token, head) scales. Every other dtype stores plain
+        # 16-bit rows with no scale bookkeeping.
+        self._is_fp8 = dtype == torch.float8_e4m3fn
         if layer_ids is None:
             num_storage_layers = num_layers
             self._layer_map: list[int] | None = None
@@ -47,15 +74,34 @@ class MHAKVCache(BaseKVCachePool):
                     raise ValueError(f"KV layer id {global_id} outside [0, {num_layers})")
                 layer_map[global_id] = dense
             self._layer_map = layer_map
+        self._device = device
+        self._alloc(num_storage_layers, num_pages, page_size, local_kv_heads, head_dim, dtype)
+        self._storage_shape = (num_pages * page_size, local_kv_heads, head_dim)
+
+    def _alloc(
+        self,
+        num_storage_layers: int,
+        num_pages: int,
+        page_size: int,
+        local_kv_heads: int,
+        head_dim: int,
+        dtype: torch.dtype,
+    ) -> None:
         self._kv_buffer = torch.empty(
             (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim),
-            device=device,
+            device=self._device,
             dtype=dtype,
         )
+        if self._is_fp8:
+            self._scale_buffer: torch.Tensor | None = torch.empty(
+                (2, num_storage_layers, num_pages * page_size, local_kv_heads),
+                device=self._device,
+                dtype=torch.float32,
+            )
+        else:
+            self._scale_buffer = None
         self._k_buffer = self._kv_buffer[0]
         self._v_buffer = self._kv_buffer[1]
-        self._device = device
-        self._storage_shape = (num_pages * page_size, local_kv_heads, head_dim)
 
     def rebuild(self, num_pages: int) -> None:
         """Reallocate the KV buffer for ``num_pages`` pages IN PLACE.
@@ -66,20 +112,14 @@ class MHAKVCache(BaseKVCachePool):
         """
         _, num_storage_layers, _old_pages, page_size, local_kv_heads, head_dim = self._kv_buffer.shape
         dtype = self._kv_buffer.dtype
-        device = self._device
         self._k_buffer = None
         self._v_buffer = None
+        self._scale_buffer = None
         self._kv_buffer = None
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
+        if self._device.type == "cuda":
+            torch.cuda.synchronize(self._device)
             torch.cuda.empty_cache()
-        self._kv_buffer = torch.empty(
-            (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim),
-            device=device,
-            dtype=dtype,
-        )
-        self._k_buffer = self._kv_buffer[0]
-        self._v_buffer = self._kv_buffer[1]
+        self._alloc(num_storage_layers, num_pages, page_size, local_kv_heads, head_dim, dtype)
         self._storage_shape = (num_pages * page_size, local_kv_heads, head_dim)
 
     @classmethod
@@ -101,7 +141,10 @@ class MHAKVCache(BaseKVCachePool):
     def unit_bytes(self) -> tuple[int, int]:
         buf = self._kv_buffer
         tokens = int(buf.shape[2]) * int(buf.shape[3])
-        return int(buf.numel() * buf.element_size()) // tokens, 0
+        bytes_per_token = int(buf.numel() * buf.element_size()) // tokens
+        if self._scale_buffer is not None:
+            bytes_per_token += self._scale_buffer.numel() * self._scale_buffer.element_size() // tokens
+        return bytes_per_token, 0
 
     def _dense(self, layer_id: int) -> int:
         if self._layer_map is None:
@@ -117,6 +160,16 @@ class MHAKVCache(BaseKVCachePool):
     def v_cache(self, index: int) -> torch.Tensor:
         return self._v_buffer[self._dense(index)]
 
+    def k_scale(self, index: int) -> torch.Tensor:
+        """Per-(token, head) FP32 K scales, fp8 KV only; (num_tokens, kv_heads)."""
+        assert self._scale_buffer is not None, "scales exist only for fp8 paged KV"
+        return self._scale_buffer[0, self._dense(index)]
+
+    def v_scale(self, index: int) -> torch.Tensor:
+        """Per-(token, head) FP32 V scales, fp8 KV only; (num_tokens, kv_heads)."""
+        assert self._scale_buffer is not None, "scales exist only for fp8 paged KV"
+        return self._scale_buffer[1, self._dense(index)]
+
     def store_kv(
         self,
         k: torch.Tensor,
@@ -127,12 +180,26 @@ class MHAKVCache(BaseKVCachePool):
         from freetoken.kernel import store_cache
 
         dense = self._dense(layer_id)
+        k_rows = k
+        v_rows = v
+        if self._is_fp8:
+            # k/v arrive flat (tokens, kv_heads*head_dim); quantize per (token, head)
+            # row and hand store_cache the same 2D layout it gets for 16-bit stores.
+            head_dim = self._storage_shape[-1]
+            k_q, k_scales = quantize_rows_e4m3(k.reshape(k.shape[0], -1, head_dim))
+            v_q, v_scales = quantize_rows_e4m3(v.reshape(v.shape[0], -1, head_dim))
+            # torch index_copy_ takes int64 only (the CUDA store kernel takes either)
+            loc = out_loc.to(torch.long)
+            self._scale_buffer[0, dense].index_copy_(0, loc, k_scales)
+            self._scale_buffer[1, dense].index_copy_(0, loc, v_scales)
+            k_rows = k_q.view(k_q.shape[0], -1)
+            v_rows = v_q.view(v_q.shape[0], -1)
         store_cache(
             k_cache=self._k_buffer[dense].view(self._storage_shape),
             v_cache=self._v_buffer[dense].view(self._storage_shape),
             indices=out_loc,
-            k=k,
-            v=v,
+            k=k_rows,
+            v=v_rows,
         )
 
     @property

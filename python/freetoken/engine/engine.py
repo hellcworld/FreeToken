@@ -115,12 +115,14 @@ def _backend_requirements_met(name: str) -> bool:
 
 
 def _resolve_auto_attention_backend(
-    required: frozenset[AttnType], hybrid_linear: bool
+    required: frozenset[AttnType], hybrid_linear: bool, kv_fp8: bool = False
 ) -> str:
     """First candidate (in per-type priority order) whose arch condition holds,
     whose packages are installed, and whose every comma part serves ALL required
     types. Reproduces the historical hardware tree for FULL-only models:
-    sm_100 -> trtllm, sm_90+sgl_kernel -> "fa,fi", flashinfer -> fi, else triton."""
+    sm_100 -> trtllm, sm_90+sgl_kernel -> "fa,fi", flashinfer -> fi, else triton.
+    With fp8 paged KV, only Triton can host the in-kernel dequant (the rest are
+    opaque vendor kernels), so the FULL tree collapses to triton alone."""
     candidates: list[tuple[str, bool]] = []
     if AttnType.DSV4 in required:
         candidates.append(("dsv4_sparse", True))
@@ -131,12 +133,15 @@ def _resolve_auto_attention_backend(
     if AttnType.SWA in required:
         candidates.append(("triton", True))
     if AttnType.FULL in required:
-        candidates += [
-            ("trtllm", is_sm100_family()),
-            ("fa,fi", is_sm90_family()),
-            ("fi", True),
-            ("triton", True),
-        ]
+        if kv_fp8:
+            candidates.append(("triton", True))
+        else:
+            candidates += [
+                ("trtllm", is_sm100_family()),
+                ("fa,fi", is_sm90_family()),
+                ("fi", True),
+                ("triton", True),
+            ]
     for name, arch_ok in candidates:
         if not arch_ok:
             continue
@@ -1311,12 +1316,61 @@ def _adjust_config(config: EngineConfig):
             "--dtype float16 with MXFP8 resident weights is unsupported (the "
             "W8A16 fold is only validated exact in bfloat16); use bfloat16."
         )
+    # fp8 paged KV (--kv-cache-dtype fp8_e4m3): K/V stored as e4m3 with per-(token,
+    # head) FP32 scales, dequantized inside the Triton attention kernels. Feasibility
+    # is checked here so the CLI and programmatic paths both fail loudly BEFORE the
+    # pool allocates.
+    _kv_raw = getattr(config, "kv_cache_dtype", "auto")
+    _kv_fp8 = False
+    if _kv_raw != "auto":
+        from freetoken.kvcache.base import resolve_kv_dtype
+
+        resolve_kv_dtype(config)  # unknown names raise here
+        _kv_fp8 = _kv_raw == "fp8_e4m3"
+    if _kv_fp8:
+        if not torch.cuda.is_available():
+            raise ValueError(
+                "--kv-cache-dtype fp8_e4m3 requires a CUDA device (the e4m3 store/"
+                "dequant paths are GPU-only); drop the flag on CPU."
+            )
+        if _dtype is not None and _dtype is not torch.bfloat16:
+            raise ValueError(
+                f"--kv-cache-dtype fp8_e4m3 with --dtype {_dtype}: the dequant "
+                "path is only validated in bfloat16; use bfloat16 (or drop the flag)."
+            )
+        if is_dsv4 or AttnType.BSA in required_attn_types:
+            raise ValueError(
+                "--kv-cache-dtype fp8_e4m3 is unsupported for this model: the "
+                "DSV4/BSA pool families require 16-bit paged KV."
+            )
+        for _spec in model_config.kv_cache_group_specs():
+            if _spec.mla or getattr(_spec, "index_head_dim", 0):
+                raise ValueError(
+                    "--kv-cache-dtype fp8_e4m3 is unsupported for MLA/DSA latent "
+                    "and indexer slabs; only plain (MHA/GQA) paged KV quantizes."
+                )
+            if getattr(_spec, "is_swa", False):
+                raise ValueError(
+                    "--kv-cache-dtype fp8_e4m3 does not yet cover the SWA window "
+                    "pool; only full-attention layers quantize."
+                )
     if config.attention_backend == "auto":
         override(
             "attention_backend",
-            _resolve_auto_attention_backend(required_attn_types, has_linear_attention),
+            _resolve_auto_attention_backend(
+                required_attn_types, has_linear_attention, kv_fp8=_kv_fp8
+            ),
         )
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
+    if _kv_fp8:
+        _parts = [p.strip() for p in config.attention_backend.split(",")]
+        if any(p != "triton" for p in _parts):
+            raise ValueError(
+                f"--kv-cache-dtype fp8_e4m3 dequantizes inside the Triton attention "
+                f"kernels, but attention backend {config.attention_backend!r} was "
+                "selected (its kernels are opaque); use --attention-backend triton "
+                "(or auto, which resolves to it) or drop the flag."
+            )
     _validate_attention_backend_choice(config, override, required_attn_types)
 
     if config.moe_cache_rate is not None:

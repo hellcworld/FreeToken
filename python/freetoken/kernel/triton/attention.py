@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .e4m3_compat import e4m3_u8_to_f32
+
 
 _MAX_KV_SPLITS = 8
 _MIN_BLOCK_KV = 32
@@ -54,12 +56,16 @@ def _paged_attention_kernel(
     q_pos_ptr,
     sm_scale,
     sinks_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
     stride_qt,
     stride_qh,
     stride_ks,
     stride_kh,
     stride_vs,
     stride_vh,
+    stride_ksc,
+    stride_vsc,
     stride_ot,
     stride_oh,
     GROUP: tl.constexpr,
@@ -68,6 +74,7 @@ def _paged_attention_kernel(
     BLOCK_N: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     HAS_SINKS: tl.constexpr,
+    KV_FP8: tl.constexpr,
 ):
     q_tok = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -113,8 +120,18 @@ def _paged_attention_kernel(
                 + kv_head * stride_kh
                 + offs_d[None, :],
                 mask=(offs_n[:, None] < kv_len) & mask_d[None, :],
-                other=0.0,
-            ).to(tl.float32)
+                other=0,
+            )
+            if KV_FP8:
+                # e4m3 rows scale back exactly (the decode is exact and e4m3 values
+                # are representable in every 16-bit type); the stored quantization
+                # is the only error this kernel sees vs a 16-bit cache.
+                k_scales = tl.load(
+                    k_scale_ptr + slots * stride_ksc + kv_head, mask=mask_n, other=0.0
+                )
+                k = e4m3_u8_to_f32(k.to(tl.uint8, bitcast=True)) * k_scales[:, None]
+            else:
+                k = k.to(tl.float32)
             scores = tl.sum(q[None, :] * k, axis=1) * sm_scale
             scores = tl.where(mask_n, scores, -float("inf"))
 
@@ -130,8 +147,15 @@ def _paged_attention_kernel(
                 + kv_head * stride_vh
                 + offs_d[None, :],
                 mask=(offs_n[:, None] < kv_len) & mask_d[None, :],
-                other=0.0,
-            ).to(tl.float32)
+                other=0,
+            )
+            if KV_FP8:
+                v_scales = tl.load(
+                    v_scale_ptr + slots * stride_vsc + kv_head, mask=mask_n, other=0.0
+                )
+                v = e4m3_u8_to_f32(v.to(tl.uint8, bitcast=True)) * v_scales[:, None]
+            else:
+                v = v.to(tl.float32)
             acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
             l_i = l_i * alpha + tl.sum(p, axis=0)
             m_i = m_new
@@ -156,12 +180,16 @@ def _decode_grouped_stage1_kernel(
     mid_o_ptr,
     mid_lse_ptr,
     num_kv_splits_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
     stride_qt,
     stride_qh,
     stride_ks,
     stride_kh,
     stride_vs,
     stride_vh,
+    stride_ksc,
+    stride_vsc,
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
@@ -179,6 +207,7 @@ def _decode_grouped_stage1_kernel(
     D: tl.constexpr,
     DV: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
+    KV_FP8: tl.constexpr,
 ):
     batch_id = tl.program_id(0)
     head_block_id = tl.program_id(1)
@@ -224,7 +253,8 @@ def _decode_grouped_stage1_kernel(
 
     if split_end > split_start:
         q = tl.load(q_ptr + q_offsets, mask=mask_h[:, None] & mask_d[None, :], other=0.0)
-        q = q.to(k_ptr.dtype.element_ty)
+        if not KV_FP8:
+            q = q.to(k_ptr.dtype.element_ty)
 
         for rel_start in tl.range(split_start, split_end, BLOCK_N):
             rel_offs = rel_start + tl.arange(0, BLOCK_N)
@@ -235,16 +265,32 @@ def _decode_grouped_stage1_kernel(
             k = tl.load(
                 k_ptr + slots[None, :] * stride_ks + k_base_offsets,
                 mask=mask_n[None, :] & mask_d[:, None],
-                other=0.0,
+                other=0,
             )
+            if KV_FP8:
+                # fp8 cache: dequantize K to q's dtype (exact) under the per-(token,
+                # head) FP32 scale, then dot in 16-bit/fp32-accum as usual.
+                k_scales = tl.load(
+                    k_scale_ptr + slots * stride_ksc + kv_head, mask=mask_n, other=0.0
+                )
+                k = (
+                    e4m3_u8_to_f32(k.to(tl.uint8, bitcast=True)) * k_scales[None, :]
+                ).to(q.dtype)
             scores = tl.dot(q, k) * sm_scale
             scores = tl.where(mask_h[:, None] & mask_n[None, :], scores, -float("inf"))
 
             v = tl.load(
                 v_ptr + slots[:, None] * stride_vs + v_base_offsets,
                 mask=mask_n[:, None] & mask_dv[None, :],
-                other=0.0,
+                other=0,
             )
+            if KV_FP8:
+                v_scales = tl.load(
+                    v_scale_ptr + slots * stride_vsc + kv_head, mask=mask_n, other=0.0
+                )
+                v = (
+                    e4m3_u8_to_f32(v.to(tl.uint8, bitcast=True)) * v_scales[:, None]
+                ).to(q.dtype)
 
             m_new = tl.maximum(tl.max(scores, axis=1), m_i)
             alpha = tl.exp(m_i - m_new)
@@ -364,8 +410,14 @@ def decode_paged_attention(
     sliding_window: int | None = None,
     sinks: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """SGLang-style split-k grouped decode attention for one query per request."""
+    """SGLang-style split-k grouped decode attention for one query per request.
+
+    ``k_scale``/``v_scale`` (both or neither): per-(slot, kv_head) FP32 scales for an
+    e4m3 paged cache; the kernels dequantize inside, so the cache tensors are passed
+    as raw uint8 bits and q keeps its own dtype."""
 
     assert q.is_cuda and k_cache.is_cuda and v_cache.is_cuda
     assert q.dim() == 3 and k_cache.dim() == 3 and v_cache.dim() == 3
@@ -387,6 +439,15 @@ def decode_paged_attention(
         assert sinks.dim() == 1
         assert sinks.numel() >= num_q_heads
         sinks = sinks.contiguous()
+    kv_fp8 = k_scale is not None
+    assert kv_fp8 == (v_scale is not None), "k_scale and v_scale must come together"
+    if kv_fp8:
+        assert k_scale.is_cuda and v_scale.is_cuda
+        assert k_scale.shape[-1] == num_kv_heads and v_scale.shape[-1] == num_kv_heads
+        # one kernel body for every GPU: load the e4m3 bits as uint8 and decode them
+        # in-kernel (exact), no native-fp8-pointer branch needed.
+        k_cache = k_cache.view(torch.uint8)
+        v_cache = v_cache.view(torch.uint8)
 
     o = out if out is not None else torch.empty_like(q)
     sinks_arg = sinks if sinks is not None else q
@@ -412,12 +473,16 @@ def decode_paged_attention(
         attn_logits,
         attn_lse,
         num_kv_splits,
+        k_scale,
+        v_scale,
         q.stride(0),
         q.stride(1),
         k_cache.stride(0),
         k_cache.stride(1),
         v_cache.stride(0),
         v_cache.stride(1),
+        k_scale.stride(0) if kv_fp8 else 1,
+        v_scale.stride(0) if kv_fp8 else 1,
         attn_logits.stride(0),
         attn_logits.stride(1),
         attn_logits.stride(2),
@@ -435,6 +500,7 @@ def decode_paged_attention(
         D=head_dim,
         DV=head_dim,
         SLIDING_WINDOW=sliding_window or 0,
+        KV_FP8=kv_fp8,
         num_warps=4,
         num_stages=2,
     )
@@ -478,12 +544,16 @@ def _extend_attention_kernel(
     prefix_lens_ptr,
     sm_scale,
     sinks_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
     stride_qt,
     stride_qh,
     stride_ks,
     stride_kh,
     stride_vs,
     stride_vh,
+    stride_ksc,
+    stride_vsc,
     stride_ot,
     stride_oh,
     GROUP: tl.constexpr,
@@ -494,6 +564,7 @@ def _extend_attention_kernel(
     BLOCK_N: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     HAS_SINKS: tl.constexpr,
+    KV_FP8: tl.constexpr,
 ):
     seq_id = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -551,8 +622,15 @@ def _extend_attention_kernel(
                 + kv_head * stride_kh
                 + offs_d[:, None],
                 mask=mask_n[None, :] & mask_d[:, None],
-                other=0.0,
+                other=0,
             )
+            if KV_FP8:
+                k_scales = tl.load(
+                    k_scale_ptr + slots * stride_ksc + kv_head, mask=mask_n, other=0.0
+                )
+                k = (
+                    e4m3_u8_to_f32(k.to(tl.uint8, bitcast=True)) * k_scales[None, :]
+                ).to(q.dtype)
             scores = tl.dot(q.to(k.dtype), k) * sm_scale
             scores = tl.where(final_mask, scores, -float("inf"))
 
@@ -568,8 +646,15 @@ def _extend_attention_kernel(
                 + kv_head * stride_vh
                 + offs_dv[None, :],
                 mask=mask_n[:, None] & mask_dv[None, :],
-                other=0.0,
+                other=0,
             )
+            if KV_FP8:
+                v_scales = tl.load(
+                    v_scale_ptr + slots * stride_vsc + kv_head, mask=mask_n, other=0.0
+                )
+                v = (
+                    e4m3_u8_to_f32(v.to(tl.uint8, bitcast=True)) * v_scales[:, None]
+                ).to(q.dtype)
             acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_new
@@ -599,6 +684,8 @@ def _extend_attention_split_kernel(
     prefix_lens_ptr,
     sm_scale,
     sinks_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
     stride_qt,
     stride_qh,
     stride_ket,
@@ -609,6 +696,8 @@ def _extend_attention_split_kernel(
     stride_kch,
     stride_vcs,
     stride_vch,
+    stride_ksc,
+    stride_vsc,
     stride_ot,
     stride_oh,
     GROUP: tl.constexpr,
@@ -619,6 +708,7 @@ def _extend_attention_split_kernel(
     BLOCK_N: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     HAS_SINKS: tl.constexpr,
+    KV_FP8: tl.constexpr,
 ):
     seq_id = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -678,8 +768,15 @@ def _extend_attention_split_kernel(
                 + kv_head * stride_kch
                 + offs_d[:, None],
                 mask=mask_n[None, :] & mask_d[:, None],
-                other=0.0,
+                other=0,
             )
+            if KV_FP8:
+                k_scales = tl.load(
+                    k_scale_ptr + slots * stride_ksc + kv_head, mask=mask_n, other=0.0
+                )
+                k = (
+                    e4m3_u8_to_f32(k.to(tl.uint8, bitcast=True)) * k_scales[None, :]
+                ).to(q.dtype)
             scores = tl.dot(q.to(k.dtype), k) * sm_scale
             scores = tl.where(final_mask, scores, -float("inf"))
 
@@ -695,8 +792,15 @@ def _extend_attention_split_kernel(
                 + kv_head * stride_vch
                 + offs_dv[None, :],
                 mask=mask_n[:, None] & mask_dv[None, :],
-                other=0.0,
+                other=0,
             )
+            if KV_FP8:
+                v_scales = tl.load(
+                    v_scale_ptr + slots * stride_vsc + kv_head, mask=mask_n, other=0.0
+                )
+                v = (
+                    e4m3_u8_to_f32(v.to(tl.uint8, bitcast=True)) * v_scales[:, None]
+                ).to(q.dtype)
             acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_new
@@ -773,8 +877,14 @@ def extend_paged_attention(
     out: torch.Tensor | None = None,
     k_extend: torch.Tensor | None = None,
     v_extend: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Block-tiled causal prefill/extend attention over paged KV cache."""
+    """Block-tiled causal prefill/extend attention over paged KV cache.
+
+    ``k_scale``/``v_scale`` (both or neither): per-(slot, kv_head) FP32 scales for an
+    e4m3 paged cache, dequantized in-kernel; ``k_extend``/``v_extend`` (the fresh
+    tokens, still 16-bit) stay untouched."""
 
     assert q.is_cuda and k_cache.is_cuda and v_cache.is_cuda
     assert q.dim() == 3 and k_cache.dim() == 3 and v_cache.dim() == 3
@@ -790,6 +900,13 @@ def extend_paged_attention(
         assert sinks.dim() == 1
         assert sinks.numel() >= num_q_heads
         sinks = sinks.contiguous()
+    kv_fp8 = k_scale is not None
+    assert kv_fp8 == (v_scale is not None), "k_scale and v_scale must come together"
+    if kv_fp8:
+        assert k_scale.is_cuda and v_scale.is_cuda
+        assert k_scale.shape[-1] == num_kv_heads and v_scale.shape[-1] == num_kv_heads
+        k_cache = k_cache.view(torch.uint8)
+        v_cache = v_cache.view(torch.uint8)
 
     o = out if out is not None else torch.empty_like(q)
     sinks_arg = sinks if sinks is not None else q
@@ -822,6 +939,8 @@ def extend_paged_attention(
             prefix_lens,
             sm_scale,
             sinks_arg,
+            k_scale,
+            v_scale,
             q.stride(0),
             q.stride(1),
             k_extend.stride(0),
@@ -832,6 +951,8 @@ def extend_paged_attention(
             k_cache.stride(1),
             v_cache.stride(0),
             v_cache.stride(1),
+            k_scale.stride(0) if kv_fp8 else 1,
+            v_scale.stride(0) if kv_fp8 else 1,
             o.stride(0),
             o.stride(1),
             GROUP=num_q_heads // num_kv_heads,
@@ -842,6 +963,7 @@ def extend_paged_attention(
             BLOCK_N=block_n,
             SLIDING_WINDOW=sliding_window or 0,
             HAS_SINKS=sinks is not None,
+            KV_FP8=kv_fp8,
             num_warps=8,
             num_stages=1,
         )
@@ -858,12 +980,16 @@ def extend_paged_attention(
         prefix_lens,
         sm_scale,
         sinks_arg,
+        k_scale,
+        v_scale,
         q.stride(0),
         q.stride(1),
         k_cache.stride(0),
         k_cache.stride(1),
         v_cache.stride(0),
         v_cache.stride(1),
+        k_scale.stride(0) if kv_fp8 else 1,
+        v_scale.stride(0) if kv_fp8 else 1,
         o.stride(0),
         o.stride(1),
         GROUP=num_q_heads // num_kv_heads,
@@ -874,6 +1000,7 @@ def extend_paged_attention(
         BLOCK_N=block_n,
         SLIDING_WINDOW=sliding_window or 0,
         HAS_SINKS=sinks is not None,
+        KV_FP8=kv_fp8,
         num_warps=8,
         num_stages=1,
     )
@@ -893,12 +1020,16 @@ def paged_attention(
     sinks: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     block_n: int = 32,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Paged causal attention for one layer.
 
     ``q`` is ``[num_query_tokens, num_q_heads, head_dim]``. KV cache tensors are
     flattened to ``[num_slots, num_kv_heads, head_dim]``. ``indptr`` and
     ``indices`` describe each request's logical KV slots in order.
+    ``k_scale``/``v_scale`` (both or neither): per-(slot, kv_head) FP32 scales for an
+    e4m3 paged cache, dequantized in-kernel.
     """
 
     assert q.is_cuda and k_cache.is_cuda and v_cache.is_cuda
@@ -913,6 +1044,13 @@ def paged_attention(
         assert sinks.dim() == 1
         assert sinks.numel() >= num_q_heads
         sinks = sinks.contiguous()
+    kv_fp8 = k_scale is not None
+    assert kv_fp8 == (v_scale is not None), "k_scale and v_scale must come together"
+    if kv_fp8:
+        assert k_scale.is_cuda and v_scale.is_cuda
+        assert k_scale.shape[-1] == num_kv_heads and v_scale.shape[-1] == num_kv_heads
+        k_cache = k_cache.view(torch.uint8)
+        v_cache = v_cache.view(torch.uint8)
 
     o = out if out is not None else torch.empty_like(q)
     sinks_arg = sinks if sinks is not None else q
@@ -929,12 +1067,16 @@ def paged_attention(
         q_positions,
         sm_scale,
         sinks_arg,
+        k_scale,
+        v_scale,
         q.stride(0),
         q.stride(1),
         k_cache.stride(0),
         k_cache.stride(1),
         v_cache.stride(0),
         v_cache.stride(1),
+        k_scale.stride(0) if kv_fp8 else 1,
+        v_scale.stride(0) if kv_fp8 else 1,
         o.stride(0),
         o.stride(1),
         GROUP=num_q_heads // num_kv_heads,
@@ -943,6 +1085,7 @@ def paged_attention(
         BLOCK_N=block_n,
         SLIDING_WINDOW=sliding_window or 0,
         HAS_SINKS=sinks is not None,
+        KV_FP8=kv_fp8,
         num_warps=8 if head_dim >= 256 else 4,
         num_stages=2,
     )

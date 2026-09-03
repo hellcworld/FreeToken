@@ -25,7 +25,7 @@ Unlock datacenter-class intelligence on the hardware you already own — Run 290
 
 ## ✨ What's New in This Fork
 
-Two features layered on upstream `main@2757bb5` (details & verification: [CHANGES.md](CHANGES.md)):
+Three features layered on upstream `main@2757bb5` (details & verification: [CHANGES.md](CHANGES.md)):
 
 **1 · Qwen3.8-27B NVFP4 support — both quant dialects**
 
@@ -71,6 +71,17 @@ A10 24 GB GPU with CUDA 13):
 | Experiment 3 -- CPU test suites (15 passed) |
 |---|
 | ![exp3](assets/fork/exp3_tests.png) |
+
+**3 · FP8 KV cache (`--kv-cache-dtype fp8_e4m3`, upstream issue #280)**
+
+```bash
+ft serve --model Qwen/Qwen3.5-35B-A3B --kv-cache-dtype fp8_e4m3   # ~1.9x KV capacity
+```
+Paged K/V stored as e4m3 with per-(token, head) FP32 dynamic scales, dequantized
+inside the Triton attention kernels (RNE-quantized on store; bf16 dot + fp32
+accumulate on read, so quantization is the only error source — near-lossless).
+Needs CUDA + bfloat16 + the Triton backend + a plain MHA/GQA model; every other
+combination fails loudly at startup.
 
 ## About
 
