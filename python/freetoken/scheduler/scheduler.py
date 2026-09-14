@@ -142,6 +142,9 @@ class Scheduler(SchedulerIOMixin):
         )
         # Decode-batch counter delimiting --moe-collect-stats sampling windows.
         self._moe_stat_batches = 0
+        # Phase of the last LAUNCHED batch ("prefill"/"decode"); drives the interleave
+        # schedule policy's alternation.
+        self._last_batch_phase: str | None = None
 
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
@@ -955,16 +958,39 @@ class Scheduler(SchedulerIOMixin):
         return True
 
     def _schedule_next_batch(self) -> ForwardInput | None:
-        # TODO: support other policies: e.g. DECODE first
-        batch = (
-            self.prefill_manager.schedule_next_batch(self.prefill_budget)
-            or self.decode_manager.schedule_next_batch()
-        )
+        batch = self._policy_pick_batch()
         if batch is None:
             return None
         forward_input = self._prepare_batch(batch)
         self._report_prompt_admissions(batch)
         return forward_input
+
+    def _policy_pick_batch(self) -> Batch | None:
+        """Prefill/decode pick under --schedule-policy, recording the launched phase.
+
+        prefill_first (default) keeps SGLang-style prefill priority. decode_first serves
+        running requests before new prefill work (queued prompts wait for a decode gap).
+        interleave alternates one decode batch between prefill batches, so a long chunked
+        prefill no longer stalls decode for its whole prompt -- decode advances between
+        chunks at the cost of ~halving prefill rate while both sides contend.
+        """
+        batch = None
+        if self.prefill_manager.runnable and self.decode_manager.runnable:
+            policy = self.config.schedule_policy
+            # decode is runnable, so schedule_next_batch returns a batch here (it only
+            # returns None with an empty running set) -- the pick launches, which keeps
+            # the spec span mutations inside schedule_next_batch on the launched path.
+            if policy == "decode_first":
+                batch = self.decode_manager.schedule_next_batch()
+            elif policy == "interleave" and self._last_batch_phase == "prefill":
+                batch = self.decode_manager.schedule_next_batch()
+        if batch is None:
+            batch = self.prefill_manager.schedule_next_batch(
+                self.prefill_budget
+            ) or self.decode_manager.schedule_next_batch()
+        if batch is not None:
+            self._last_batch_phase = "prefill" if batch.is_prefill else "decode"
+        return batch
 
     def _report_prompt_admissions(self, batch: Batch) -> None:
         """Publish first-prefill accounting only after batch preparation succeeded.

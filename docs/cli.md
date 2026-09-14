@@ -45,6 +45,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--max-output-tokens` | 32768 | Default output budget for requests that omit one |
 | `--max-seq-len-override` | from checkpoint | Max sequence length |
 | `--max-prefill-length` | 8192 | Chunked-prefill chunk size in tokens |
+| `--schedule-policy` | prefill_first | Batch pick when prefill and decode are both runnable: `prefill_first` (finish queued/chunked prefills first; best TTFT), `decode_first` (running requests win; queued prompts wait for a decode gap), `interleave` (one decode batch between prefill chunks — steady output for running requests under concurrent long prompts at ~half prefill rate; recommended for multi-client agent serving) |
 | `--cuda-graph-max-bs`, `--graph` | = max running requests | Max batch size captured as CUDA graphs |
 | `--decode-log-interval` | 40 | Scheduler status line every N decode steps |
 

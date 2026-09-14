@@ -15,6 +15,10 @@ def _get_pid_suffix() -> str:
 class SchedulerConfig(EngineConfig):
     max_extend_tokens: int = 8192
     cache_type: str = "radix"
+    # Batch pick when prefill and decode are both runnable (scheduler._policy_pick_batch):
+    # prefill_first = SGLang-style prefill priority; decode_first = running requests win
+    # (queued prompts wait); interleave = one decode batch between prefill chunks.
+    schedule_policy: str = "prefill_first"
     offline_mode: bool = False
     decode_log_interval: int = 40
     special_token_ckpt: bool = False

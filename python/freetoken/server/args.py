@@ -436,6 +436,22 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--schedule-policy",
+        type=str,
+        default=ServerArgs.schedule_policy,
+        choices=["prefill_first", "decode_first", "interleave"],
+        help=(
+            "Batch pick when prefill and decode are both runnable. 'prefill_first' "
+            "(default) finishes queued/chunked prefills before decode, minimizing TTFT "
+            "but stalling running requests' output for a whole long prompt. "
+            "'decode_first' serves running requests first (queued prompts wait for a "
+            "decode gap). 'interleave' alternates one decode batch between prefill "
+            "chunks: steady output under concurrent long prompts at ~half prefill rate "
+            "-- recommended for multi-client agent serving."
+        ),
+    )
+
+    parser.add_argument(
         "--enable-cache-report",
         action="store_true",
         default=ServerArgs.enable_cache_report,
