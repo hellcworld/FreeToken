@@ -1,7 +1,7 @@
 # Fork 变更说明 / Fork Notes
 
 本仓库是 [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) 的 fork,
-在上游 `main`(`2757bb5`,v0.1.2 之后)之上叠加了两个功能提交,均在分支
+在上游 `main`(`2757bb5`,v0.1.2 之后)之上叠加了功能提交,均在分支
 `feat/qwen-vision` 上(线性堆叠):
 
 | 本 fork 提交 | 内容 |
@@ -200,6 +200,66 @@ Linux 或更新驱动后复测多请求批量 e2e。单提示对照(plain vs spe
 该机完成并通过。回归:tests/scheduler、
 tests/engine、tests/kvcache、tests/models、tests/tokenizer、tests/server、
 tests/daemon 与改动前基线完全一致(零回归)。
+
+## 五、decode 输出速度优化批次（调度/度量/图尺寸）
+
+面向 35B MoE offload 服务(qwen3.6-35b-a3b)的三项低风险代码改进 + 一份 spec
+图捕获设计备忘。零行为变化项默认关闭或保持默认。
+
+### 5.1 专家缓存命中率度量(`--moe-collect-stats` + `/v1/stats` moe 块)
+
+offload 后端 decode 速度的第一决定因素是专家缓存命中率,但
+`EngineConfig.moe_collect_stats` 此前只有字段没有 flag,命中率无从观测:
+
+- **flag**:`--moe-collect-stats`(args.py)——把设备侧 miss 计数器捕获进 decode
+  CUDA 图(机制上游已有,engine.py 在图捕获前设置)。
+- **采样窗口**:调度器按 `--decode-log-interval`(默认 40)个 decode 批为一个
+  窗口,窗口边界读一次计数器(设备同步摊销到 1/40)并 `reset_stats()` 重新定界
+  ——报告的是**近期**命中率而非寿命平均,直接服务缓存尺寸 A/B。
+- **通路**:`DetokenizeMsg`/`UserReply` 新增 4 个 float 字段(miss_rate/
+  active_per_layer/missing_per_layer/fetch_rate,-1.0 = 未报告,0.0 是合法值)
+  → detokenizer 透传 → `StatsTracker` 保持最近值(同 kv/mamba 语义)→
+  `/v1/stats` 输出 `moe` 块(miss_rate + hit_rate 补数 + hybrid 的 fetch_rate,
+  未报告时为 null)→ `ft ctl stats` 增加一行。
+- 测试:`tests/scheduler/test_moe_stats_window.py`(窗口节拍/门控)、
+  `tests/server/test_stats_moe.py`(observe/build_stats 语义)、
+  `tests/server/test_message_wire.py` 增线上往返。
+
+### 5.2 调度策略(`--schedule-policy prefill_first|decode_first|interleave`)
+
+上游调度是严格 prefill 优先(scheduler.py 原 TODO):多请求并发时长 prompt 的
+chunked prefill(8K/chunk)期间 decode 完全停摆,running 请求输出骤降(实测首
+token ~10s 排队即此因)。`Scheduler._policy_pick_batch` 实现三策略,记录已发射
+批的 phase 驱动交替:
+
+- `prefill_first`(默认,行为不变):SGLang 式 prefill 优先,TTFT 最优;
+- `decode_first`:running 请求优先,排队 prompt 等解码间隙(长输出场景可能饿
+  等,显式选择);
+- `interleave`:prefill 批间严格插入一个 decode 批——decode 在长 prefill 期间
+  保持输出(约半速 prefill 为代价),**多客户端 agent 服务推荐**。
+- spec 批语义保留:decode 分支仅在 `decode_manager.runnable` 为真时采纳,其
+  `schedule_next_batch` 内的 spec 跨度展开始终落在被发射的批上。
+- 测试:`tests/scheduler/test_schedule_policy.py`(三策略 + 单边回退 +
+  decode 排空时退化)。
+
+### 5.3 CUDA 图批尺寸(`--cuda-graph-bs` + 默认梯子补 3)
+
+- 默认候选梯子 `[1,2,4]+range(8,...)` 意味着 bs=3 的 decode 批回放 bs=4 的图,
+  每步浪费 1/4 行——梯子补 3 为 `[1,2,3,4]+...`(多一张小图,近零显存成本);
+- 新增 `--cuda-graph-bs 1,2,3,4` 显式覆盖候选列表(与 DSV4 的 max_running_req
+  钳制兼容,engine.py 已有的列表钳制直接生效)。
+- 顺带:`--speculative-algorithm/--speculative-num-draft-tokens` 补进
+  docs/cli.md(CHANGES 第四节曾记录它们未文档化)。
+
+### 5.4 spec 图捕获 + overlap 恢复:设计备忘(未实现)
+
+`docs/spec-graph-design.md`:uniform-span 门控捕获(图键 (bs,K))、静态
+缓冲清单(staged/out_loc/positions/页表行快照/stash/gdn slots)、两处必须设备
+化的算子(conv 窗口重建的 gather 化、draft 步 metadata 静态化)、页表快照如何
+同时解锁 overlap 恢复,以及四步验收阶梯(合成模型逐 token 一致 → 混合跨度回退
+→ 真实 checkpoint A/B → 原生 Linux 多请求 e2e)。盲写不可验证的图捕获代码风险
+不可控(spec 路径历史上每轮深挖审计都修出严重 bug),留待有 GPU 的会话按备忘
+实现。
 
 ## 版本说明 / Versioning
 

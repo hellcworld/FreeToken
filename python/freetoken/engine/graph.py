@@ -83,7 +83,9 @@ def _determine_cuda_graph_bs(
     if cuda_graph_max_bs < 1:
         return []
 
-    candidates = [1, 2, 4] + list(range(8, cuda_graph_max_bs + 1, 8))
+    # bs=3 is worth its own graph: the [1,2,4] ladder would otherwise pad a 3-request
+    # decode batch onto the bs=4 graph and burn a quarter of every step's rows.
+    candidates = [1, 2, 3, 4] + list(range(8, cuda_graph_max_bs + 1, 8))
     return [bs for bs in candidates if bs <= cuda_graph_max_bs]
 
 

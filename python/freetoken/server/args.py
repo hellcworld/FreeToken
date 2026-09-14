@@ -329,6 +329,20 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--cuda-graph-bs",
+        type=lambda s: [int(x) for x in s.split(",")],
+        dest="cuda_graph_bs",
+        default=ServerArgs.cuda_graph_bs,
+        help=(
+            "Explicit comma-separated batch sizes to capture as CUDA graphs (e.g. "
+            "'1,2,3,4'); overrides the default candidate list, and --cuda-graph-max-bs "
+            "then only gates replay (a batch larger than max(list) runs eager). Worth "
+            "setting when decode runs at odd batch sizes: the default list pads bs=3 "
+            "to a bs=4 graph, wasting a quarter of each decode step's rows."
+        ),
+    )
+
+    parser.add_argument(
         "--num-tokenizer",
         "--tokenizer-count",
         type=int,

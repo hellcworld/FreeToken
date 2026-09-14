@@ -47,6 +47,9 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--max-prefill-length` | 8192 | Chunked-prefill chunk size in tokens |
 | `--schedule-policy` | prefill_first | Batch pick when prefill and decode are both runnable: `prefill_first` (finish queued/chunked prefills first; best TTFT), `decode_first` (running requests win; queued prompts wait for a decode gap), `interleave` (one decode batch between prefill chunks — steady output for running requests under concurrent long prompts at ~half prefill rate; recommended for multi-client agent serving) |
 | `--cuda-graph-max-bs`, `--graph` | = max running requests | Max batch size captured as CUDA graphs |
+| `--cuda-graph-bs` | `1,2,3,4,8,16,...` | Explicit comma-separated graph batch sizes (e.g. `1,2,3,4`); overrides the default candidate ladder — set it to your actual decode batch sizes so odd sizes don't pad up to the next graph |
+| `--speculative-algorithm` | off | `MTP`: draft-then-verify speculative decoding from the checkpoint's MTP head. Greedy output is token-identical to plain decoding; non-greedy requests fall back to plain cycles. Needs a Qwen3.5-family checkpoint with an `mtp.*` shard (NVFP4/bf16 dialects; fp8_block experts rejected), Triton backend, TP=1 |
+| `--speculative-num-draft-tokens` | 2 | Draft chain length K per spec cycle (verify processes K+1 rows); cycles near a request's output budget shrink K automatically |
 | `--decode-log-interval` | 40 | Scheduler status line every N decode steps |
 
 ### Choosing a GPU
