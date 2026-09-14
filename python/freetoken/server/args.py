@@ -352,6 +352,35 @@ def parse_args(
         help="Print one decode scheduler status line every N decode forwards.",
     )
 
+    parser.add_argument(
+        "--speculative-algorithm",
+        type=str,
+        dest="speculative_algorithm",
+        default=ServerArgs.speculative_algorithm,
+        choices=["MTP"],
+        help=(
+            "Enable MTP speculative decoding: the checkpoint's trailing MTP layer "
+            "(``mtp.*`` weights, normally dropped at load) drafts a short token chain "
+            "each step and the target model verifies it in one forward. Mathematically "
+            "lossless (greedy output is token-identical to non-speculative decoding); "
+            "non-greedy requests automatically fall back to plain decoding. Requires a "
+            "plain MHA/GQA Qwen3.5-family checkpoint that ships MTP weights, the Triton "
+            "attention backend, and TP=1; anything else fails loudly at startup."
+        ),
+    )
+
+    parser.add_argument(
+        "--speculative-num-draft-tokens",
+        type=_positive_int,
+        dest="speculative_num_draft_tokens",
+        default=ServerArgs.speculative_num_draft_tokens,
+        help=(
+            "Draft chain length K for --speculative-algorithm MTP: the verify pass "
+            "processes K+1 tokens per request per cycle. 2-3 is a good starting point; "
+            "higher K raises the ceiling but also the cost of rejected drafts."
+        ),
+    )
+
     kv_capacity_group = parser.add_mutually_exclusive_group()
     kv_capacity_group.add_argument(
         "--num-pages",

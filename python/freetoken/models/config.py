@@ -317,6 +317,20 @@ class ModelConfig:
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1
+    # MTP draft head (Qwen3.5 family): number of trailing MTP layers the checkpoint ships
+    # (HF ``mtp_num_hidden_layers``; 0 = none). Parsed by the model's parse_config; the
+    # ``mtp.*`` weights are only LOADED (and the draft head only BUILT) when the engine
+    # enables MTP speculation, which flips ``enable_mtp`` in Engine._adjust_config.
+    num_mtp_layers: int = 0
+    enable_mtp: bool = False
+
+    @property
+    def mtp_layer_ids(self) -> tuple[int, ...]:
+        """Global KV-layer ids of the MTP draft head's attention layers (one slab each in
+        the paged KV pool, right after the target layers)."""
+        return tuple(
+            self.num_layers + i for i in range(self.num_mtp_layers if self.enable_mtp else 0)
+        )
 
     @property
     def is_moe(self) -> bool:

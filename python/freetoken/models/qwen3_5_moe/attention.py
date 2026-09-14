@@ -28,7 +28,7 @@ class Qwen3_5Attention(BaseOP):
     column/row-parallel for tensor parallelism later.
     """
 
-    def __init__(self, config: ModelConfig, layer_id: int):
+    def __init__(self, config: ModelConfig, layer_id: int, quant: bool = True):
         head_dim = config.head_dim
         self.layer_id = layer_id
         self.num_q = config.num_qo_heads
@@ -42,8 +42,17 @@ class Qwen3_5Attention(BaseOP):
         self._qkv_split = [self.num_q * head_dim * 2, self.kv_attn_dim, self.kv_attn_dim]
         # Block-fp8 (Fp8BlockColMerged) when the checkpoint is quantized, else bf16
         # LinearColParallelMerged. q/k/v out dims are all /128, so the merged fp8 weight +
-        # weight_scale_inv concatenate cleanly along the output dim.
-        self.qkv_proj = make_col_merged(config, config.hidden_size, self._qkv_split, has_bias=False)
+        # weight_scale_inv concatenate cleanly along the output dim. ``quant=False`` forces
+        # the bf16 linears regardless of the model's quant config -- the MTP draft head's
+        # projections ship un-quantized in every checkpoint dialect.
+        if quant:
+            self.qkv_proj = make_col_merged(config, config.hidden_size, self._qkv_split, has_bias=False)
+        else:
+            from freetoken.layers import LinearColParallelMerged
+
+            self.qkv_proj = LinearColParallelMerged(
+                config.hidden_size, self._qkv_split, has_bias=False
+            )
         # Qwen3.5 uses Gemma-style (1+weight) RMSNorm; the weight loader bakes the +1
         # into the stored weight (GemmaRMSNorm scales by the raw weight).
         self.q_norm = GemmaRMSNorm(head_dim, eps=config.rms_norm_eps)
@@ -59,7 +68,12 @@ class Qwen3_5Attention(BaseOP):
                 else None
             ),
         )
-        self.o_proj = make_replicated(config, self.qo_attn_dim, config.hidden_size, has_bias=False)
+        if quant:
+            self.o_proj = make_replicated(config, self.qo_attn_dim, config.hidden_size, has_bias=False)
+        else:
+            from freetoken.layers import LinearReplicated
+
+            self.o_proj = LinearReplicated(self.qo_attn_dim, config.hidden_size, has_bias=False)
         # Interleaved mRoPE (vision builds): the Qwen3.5 full-attention rope selects the
         # T/H/W axis per frequency slot (slot i -> axis i%3, frequencies continuous), so a
         # 1-D position cache cannot express it. Multimodal prefills carry explicit 3-row

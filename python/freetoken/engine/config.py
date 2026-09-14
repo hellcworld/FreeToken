@@ -85,6 +85,15 @@ class EngineConfig:
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
+    # MTP speculative decoding (--speculative-algorithm MTP): the checkpoint's MTP layer
+    # drafts K tokens per step and the target verifies them in one forward. Output is
+    # mathematically lossless (greedy). None disables speculation. Validated/resolved in
+    # Engine._adjust_config, which also flips model_config.enable_mtp so the model builds
+    # the draft head and the loader stops dropping the ``mtp.*`` weights.
+    speculative_algorithm: str | None = None
+    # Draft tokens per spec cycle (the chain length K); the verify pass processes K+1
+    # tokens per request. Cycles near a request's output budget shrink K automatically.
+    speculative_num_draft_tokens: int = 2
 
     @cached_property
     def hf_config(self):

@@ -509,6 +509,28 @@ class CacheManager:
             req.cache_handle = SWACacheHandle(m.cached_len, m.node, m.kv_indices)
             self.lock(req.cache_handle)
 
+    def free_spec_tail(self, table_idx: int, start: int, end: int) -> None:
+        """Return the paged-KV pages of an MTP verify pass's rejected draft rows.
+
+        ``[start, end)`` are raw positions in the request's page-table row — the span the
+        spec batch allocated at prepare time minus what the acceptance actually committed
+        (``start`` is the committed boundary: the position the next cycle will forward
+        into, whose own KV does not exist yet). Only pages FULLY inside ``[start, end)``
+        are freed — the partial page holding the last committed row stays (it was
+        allocated when the sequence first extended into it and is still live). The draft
+        head's KV slab shares these physical slots, so one free reclaims both the
+        target's and the draft's rejected rows. Callers run inside a
+        ``lazy_free_region`` (the drain path does), so the free defers to the region exit.
+        """
+        if end > start:
+            ps = self.page_size
+            first_page = -(-start // ps)  # ceil: first page fully at-or-after ``start``
+            last_page = -(-end // ps)
+            if last_page > first_page:
+                self._free(
+                    self.page_table[table_idx, first_page * ps : last_page * ps]
+                )
+
     def _padded_tail(self, req: Req, start: int) -> torch.Tensor:
         """The request's OWN slice [start, page_ceil(cached_len)) of the page table. A finish
         frees through the page-CEIL bound, not cached_len: allocate_paged allocates (and, when

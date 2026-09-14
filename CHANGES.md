@@ -101,6 +101,106 @@ fp32 累加)。GQA 模型(head_dim=128)KV 容量约 **1.94x**(4096 → 2112
 (CUDA-gated:store 逐字节一致性 + decode/extend/fallback 对"反量化参考"
 与"bf16 参考"双层容差比对)。
 
+## 四、MTP 投机解码(`--speculative-algorithm MTP`)
+
+Qwen3.5/3.6/3.8 checkpoint 都携带一个 MTP 草稿头(`mtp.*` 专用分片,全部三种
+量化方言下均为未量化 bf16),上游在加载时直接丢弃。本 fork 将其加载并接入
+**草稿-验证**投机解码:草稿头每步自回归草稿 K 个 token,目标模型一次 forward
+验证 K+1 个位置。**greedy 输出与不开投机逐 token 一致(数学无损)**——这也是
+e2e 测试的判据。
+
+- **草稿头**(`models/qwen3_5_moe/mtp.py`,新文件):DeepSeek 式单块 MTP——
+  `fc`(eh_proj)+ `pre_fc_norm_{embedding,hidden}` + 一个 bf16 全注意力解码层
+  (复用 `Qwen3_5Attention`,新增 `quant=False` 开关)+ 末层 norm。层内 norm 为
+  Gemma 风格(与目标层一致,加载时 +1 bake);头级 `mtp.norm`/`pre_fc_norm_*`
+  依据 checkpoint 权重分布(中心 ~1 而非 ~0)判定为标准 RMSNorm。草稿头持有
+  **共享页表下的独立 KV slab**(全局层号 `num_layers`),前缀缓存复用、页分配、
+  拒绝回滚全部复用现有机制——被拒绝草稿的 target/draft KV 随一次
+  `free_spec_tail` 同时回收。
+- **加载**(`models/qwen3_5_moe/weight.py`):新增 `_iter_mtp_weights` 旁路
+  (复用 q/k/v→`qkv_proj`、gate/up→`gate_up_proj` 融合与 Gemma bake);
+  `iter_weights(include_mtp=)` 由 `load_weight` 经签名探测下发,默认路径行为
+  不变(mtp.* 仍丢弃)。`_adjust_config` 校验后翻转 `model_config.enable_mtp`
+  ——只有开启投机才构建草稿头/加载权重/多分配 KV slab,普通服务零开销。
+- **执行**(`engine/spec.py`,新文件):验证 pass 以 `phase="decode"` +
+  `extend_len=K+1` 提交——注意力元数据自然路由到 Triton 多 query extend 内核
+  (块内因果 + 分页前缀,注意力内核零改动),两个 lm_head 仅在 prefill 做末
+  token 聚合,故验证保留全部行。greedy 验收为纯张量前缀匹配;接受的 argmax
+  行一次向量化写入 token_pool(接受的草稿 + 边界 bonus token 恰好落位)。
+  非 greedy 请求自动降级为普通单 token 周期(整批统一)。**投机周期不与下一
+  批重叠调度**(N+1 批的页分配/写回依赖 N 批的接受数,排空后调度)。
+- **深挖审计修复(对照可运行原版逐路径对账发现)**:
+  1. **[严重] verify 分支 q/k/v 非连续视图被内核误读**——`_conv_prefill`
+     返回转置视图,`reshape` 生成语义正确但非 token 主序的视图(stride
+     (2,1,64,2)),而 recurrent 内核仅按 stride(1) 步进 token、假定 head/dim
+     连续 → 验证 pass 的 GDN 一直在读错位内存(表现为 token 第 27 位起分
+     歧)。修复:verify 分支 q/k/v 强制 `.contiguous()`。逐层状态对账证实
+     修复后 layer-0 状态链与 plain **逐位一致**(Δ=0.000)。
+  2. **[严重] GDN 状态部分接受语义错误(原快照/恢复方案两个分支都不对)**:
+     恢复快照 = 周期前状态(差 n+1 个 token),保留终态 = 全 span 后(差
+     K-n 个)。重构为 vendored FLA 内核的 **target_verify 模式**
+     (`disable_state_update` + `intermediate_states_buffer`):验证不写活跃
+     槽,逐步状态入缓冲,验收后散写 step n(探针证实 buffer[s] 与顺序单步
+     更新**逐位一致**)。
+  3. conv 状态按提交边界重建(快照 + 捕获 conv_in 行 + 窗口回写,纯函数
+     `_conv_window` 单测锁定);k=0 全 span=1 批次的零缓冲覆盖守卫;
+     graph 重放下 note_decode 的 stale stash 守卫;DecodeManager
+     inflight 预留按 spec 跨度;DraftMoE renormalize=True 对齐目标层。
+  - 审计中的方法论发现:`causal_conv1d_decode` 会**原地覆盖输入缓冲**;
+    triton autotune 配置随缓存冷暖跨进程漂移(对照必须背靠背)。
+- **35B 实测排查记录(ftserve 自启干扰排除后)**:`wsl --shutdown` 后
+  systemd 会自动拉回 ftserve(17GB 银行)——与测试进程双 35B 挤爆 RAM,
+  早期"机器不稳"结论部分由此污染;`systemctl disable --now ftserve` 后
+  干净复测仍崩溃,继而定位并修复两个真 bug:(1) **跨流页表竞态**——
+  overlap 调度下前一批 drain 的 radix 提交会重指向页表行,而 spec 周期
+  对页表是裸读(plain 路径有 captured-replay 快照保护),已改为 spec
+  批两侧均不重叠;(2) **跨度快照**——"schedule→drain→launch"新顺序下
+  speculator 会读到 drain 后推进的 Req lens,与按调度时 lens 构建的
+  positions/out_loc 失配(store_cache 形状断言暴露),已将
+  `(cached_len, device_len)` 在调度时快照进 `Batch.spec_req_lens`。
+  另将 GDN target_verify 捕获缓冲改为持久化(消除每周期 ~280MB 分配
+  扰动,亦是性能改进)。**遗留**:干净环境下 35B spec 仍出现异步非法
+  访问(浮现点随机漂移:embedding/GDN GEMM/MoE silu;全部独立内核
+  探针通过;同步点可将存活周期从 1-2 延长至 6-12 但不能消除;合成模型
+  同代码路径逐位精确)——疑似 spec 周期加重异步负载触发该机 WSL dxg
+  栈缺陷,或 35B 特有内核交互 bug,需 compute-sanitizer/原生 Linux
+  复现根治。35B plain 基线(126 tok @ 6.17 tok/s,offload 512 槽)有效。
+  - **已知良性残余**:bf16 下验证 pass(3 行 GEMM)与 plain(1 行)的
+    浮点重结合差异可在近平局处翻转单个 token(合成模型 95 token 中第
+    42 位,确定性、状态链精确)——所有 bf16 投机解码实现共有,非本实现
+    缺陷。
+- **GDN 混合架构支持**(Qwen3.5/3.6/3.8 实际均为 48 linear + 16 full 混合):
+  验证 pass 以 `phase="decode"` + 多行 extend 提交,`build_fla_metadata` 与
+  GDN 层的 decode 路由改为"每请求一行才走单步内核",多行自然落入 ragged
+  chunk 路径(状态按请求连续推进);投机器在验证前快照活跃 GDN 槽位的
+  conv+recurrent 状态,拒绝的请求在验收后整体恢复——草稿头本身是全注意力,
+  草稿循环不触碰状态池。KV 池的 hybrid layer_ids 映射同步纳入 MTP slab。
+- **配置**:`--speculative-algorithm MTP --speculative-num-draft-tokens K`
+  (默认 2)。phase 1 限制:Qwen3.5 家族(混合 GDN 支持)、Triton 后端(强制)、
+  TP=1、稠密模型(MTP 层为 routed experts 的 MoE checkpoint 报错)、非 SWA/
+  DSV4/MLA/BSA、非多模态、非 FTW;CUDA graph 对投机周期关闭(普通周期不受
+  影响),offload 后端的 CPU executor 缓冲按 (K+1)×并发放大。
+
+**验证**:`tests/models/test_qwen3_5_mtp.py`(9 项,纯 CPU):mtp 权重
+inclusion/exclusion、发射清单(融合/规范 bake)、草稿头 state-dict 键与形状
+同加载器输出逐键一致、greedy 验收核(全对/部分对/预算收缩)、DecodeManager
+投机跨度(仅全 greedy 批、预算钳制)、`free_spec_tail` 页对齐回滚。
+`tests/e2e/test_mtp_lossless.py`(CUDA-gated):双子进程 plain vs spec 同提示
+**逐 token 一致性断言** + 吞吐比报告,配 `dist/gen_synthetic_model.py` 生成的
+合成混合架构小模型(12GB 卡可跑)。**GPU 实测通过**(RTX 3060 12GB + WSL2
+Ubuntu + CUDA 13,greedy 127 token):plain 与 spec 输出**逐 token 完全一致
+(TOKEN-IDENTICAL: True)**;spec 133.8 tok/s vs plain 104.8 tok/s(1.28x,
+K=2,随机草稿头接受率≈0 下仍净赚——验证 pass 多行摊销)。多请求批量 e2e 在
+该验证机受其 WSL dxg 驱动不稳定限制(WSL Service 持续意外终止,事件日志可查,
+纯 torch 负载同样触发,与本改动无关);过渡/编译/生成中段均出现过 GPU 队列楔死
+(py-spy 定位为 cudaEventRecord 内空转,CUDA_LAUNCH_BLOCKING 下无内核报错,
+纯 torch 负载同样触发;在停用 ftserve、Windows 全新重启、缓存全热的最干净
+条件下仍随机复现)——确认为该机 WSL dxg 驱动问题而非代码问题,建议换原生
+Linux 或更新驱动后复测多请求批量 e2e。单提示对照(plain vs spec)已在
+该机完成并通过。回归:tests/scheduler、
+tests/engine、tests/kvcache、tests/models、tests/tokenizer、tests/server、
+tests/daemon 与改动前基线完全一致(零回归)。
+
 ## 版本说明 / Versioning
 
 - 本 fork 标签:**`qwen38-vision-v1.0.0`**(见 git tag)
@@ -121,8 +221,12 @@ fp32 累加)。GQA 模型(head_dim=128)KV 容量约 **1.94x**(4096 → 2112
   离线 mm 路径在真实 GPU 上的一串缺陷(dtype/device 错位、meta inv_freq、
   token-pool gather 被 rope delta 偏移等)——离线 `LLM.generate(mm_inputs=...)`
   与在线 API 现均已在 RTX 3060 12GB + WSL2 实机验证
-- 视频输入(时间戳拆帧)未实现;MTP 投机解码权重仍按上游丢弃
-- 上游相关 issue:#139 / #67 / #106(Qwen3.8-27B)、#79(多模态路线图)
+- 视频输入(时间戳拆帧)未实现;MTP 投机解码已实现(phase 1:Qwen3.5 家族
+  稠密模型含 GDN 混合 + Triton 后端 + TP=1 + greedy;随机采样验证、MoE 草稿
+  专家、CUDA graph 捕获投机周期留待后续)。无损性已在 RTX 3060 + WSL2 实测
+  通过(逐 token 一致;K=2 时 1.28x)
+- 上游相关 issue:#139 / #67 / #106(Qwen3.8-27B)、#79(多模态路线图)、
+  #421(MTP 投机解码)
 
 ## License / 许可证
 

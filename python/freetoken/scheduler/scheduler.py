@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
+from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias, Union
 
 import torch
 from freetoken.attention.linear import build_fla_metadata
@@ -36,6 +36,7 @@ from .table import TableManager
 
 if TYPE_CHECKING:
     from freetoken.engine import BatchSamplingArgs, ForwardOutput
+    from freetoken.engine.spec import SpecForwardOutput
 
 
 logger = init_logger(__name__)
@@ -55,7 +56,7 @@ class ForwardInput(NamedTuple):
     write_tuple: Indice2D  # (req_mapping, seq_lens or -1)
 
 
-ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
+ForwardData: TypeAlias = "Tuple[ForwardInput, Union[ForwardOutput, SpecForwardOutput]]"
 
 
 class Scheduler(SchedulerIOMixin):
@@ -88,6 +89,8 @@ class Scheduler(SchedulerIOMixin):
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
         )
         self.decode_manager = DecodeManager(config.page_size)
+        if getattr(self.engine.config.model_config, "enable_mtp", False):
+            self.decode_manager.spec_k = self.engine.spec.num_draft_tokens
         self.prefill_manager = PrefillManager(
             self.cache_manager, self.table_manager, self.decode_manager
         )
@@ -222,15 +225,24 @@ class Scheduler(SchedulerIOMixin):
         ):
             self._execute_pending_rebuild()
 
-        # Order this iteration's host->device token_pool copies (issued on ``self.stream``
-        # during scheduling) after the previous batch's sampled-token writes (issued on the
-        # engine stream in ``_forward``). Without this, a request that reuses a just-freed
-        # table_idx can have its freshly copied prompt clobbered by the prior occupant's
-        # still-pending output write -- corrupting tokens (e.g. dropping an image
-        # placeholder, which the multimodal merge then rejects).
+        # Spec cycles never overlap with adjacent batches' GPU-visible bookkeeping:
+        # a spec cycle reads the page table LIVE (the draft-step and verify metadata
+        # gathers run on the engine stream mid-cycle), while a concurrent drain's
+        # radix commit RE-POINTS page-table rows (dedup re-point) and frees pages —
+        # plain decode is guarded by the captured-replay table snapshot; the spec
+        # path has no such snapshot. So drain batch N-1 before launching a spec
+        # batch, and (the early-drain below) before scheduling after one.
         self.stream.wait_stream(self.engine.stream)
         forward_input = self._schedule_next_batch()
         ongoing_data = None
+        if forward_input is not None and last_data is not None and (
+            last_data[0].batch.spec_num_draft_tokens
+            or forward_input.batch.spec_num_draft_tokens
+        ):
+            self.stream.wait_stream(self.engine.stream)
+            self._process_last_data(last_data)
+            self._flush_abort_acks()
+            last_data = None
         if forward_input is not None:
             with self.engine_stream_ctx:  # run the batch in the engine's stream
                 self.engine.stream.wait_stream(self.stream)
@@ -303,10 +315,22 @@ class Scheduler(SchedulerIOMixin):
         if last_data is None:
             return
 
-        batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
+        batch = last_data[0].batch
+        forward_output = last_data[1]
+        from freetoken.engine.spec import SpecForwardOutput  # lazy: engine pkg is heavy
+
+        spec_drain = isinstance(forward_output, SpecForwardOutput)
+        if spec_drain:
+            next_tokens_cpu = forward_output.argmax_cpu
+            accepted_cpu = forward_output.accepted_cpu
+            copy_done = forward_output.copy_done_event
+        else:
+            next_tokens_cpu, copy_done = forward_output[1], forward_output[2]
         copy_done.synchronize()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
+        # Flat verify-row cursor for spec drains (each request contributes extend_len rows).
+        spec_row = 0
         with self.cache_manager.lazy_free_region():
             for i, req in enumerate(batch.reqs):
                 if isinstance(req, ChunkedReq):
@@ -323,6 +347,10 @@ class Scheduler(SchedulerIOMixin):
                     # Aborted while this final-chunk prefill / decode step was in flight: free
                     # here (the forward is drained) and finish the request. No DetokenizeMsg --
                     # the abort ack flushed after this method stays the uid's terminal reply.
+                    if spec_drain:
+                        # The verify span's KV is reclaimed wholesale by the resource free;
+                        # just skip its rows in the flat argmax layout.
+                        spec_row += req.extend_len
                     self.decode_manager.remove_req(req)
                     self._free_req_resources(req)
                     new_finished_reqs.add(req)
@@ -333,43 +361,67 @@ class Scheduler(SchedulerIOMixin):
                     # and the next batch is scheduled before this drain runs). Its resources
                     # are freed below/already; shipping this token would append past the
                     # client's terminal reply.
+                    if spec_drain:
+                        spec_row += req.extend_len
                     continue
-                next_token = next_tokens_cpu[i]
-                req.append_host(next_token.unsqueeze(0))
-                next_token = int(next_token.item())
-                # EOS / stop-string -> "stop", output budget exhausted -> "length";
-                # EOS and stop strings win over length.
-                hit_length = not req.can_decode
-                hit_eos = (
-                    not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
-                )
-                matched_stop = (
-                    self._match_stop_str(req)
-                    if not hit_eos and req.sampling_params.stop_strs
-                    else None
-                )
-                finished = hit_length or hit_eos or matched_stop is not None
-                finish_reason = (
-                    ("stop" if (hit_eos or matched_stop is not None) else "length")
-                    if finished
-                    else None
-                )
-                if (
-                    next_token == self.toolcall_anchor_id
-                    and req.toolcall_anchor_len is None
-                    and not finished
-                ):
-                    req.toolcall_anchor_len = req.input_ids.numel()
-                reply.append(
-                    DetokenizeMsg(
-                        uid=req.uid,
-                        next_token=next_token,
-                        finished=finished,
-                        finish_reason=finish_reason,
-                        matched_stop=matched_stop,
-                        stop_strs=req.sampling_params.stop_strs or None,
+                if spec_drain:
+                    # Commit the accepted draft tokens: cached_len advances past the last
+                    # accepted position; the rejected verify rows' KV returns to the pool.
+                    # (The engine already wrote all accepted token ids into the token pool
+                    # — including the bonus/correction token at the accepted boundary.)
+                    span = req.extend_len
+                    n = int(accepted_cpu[i])
+                    new_tokens = next_tokens_cpu[spec_row : spec_row + n + 1]
+                    committed = req.cached_len + n + 1
+                    alloc_end = req.device_len
+                    req.cached_len = committed
+                    req.device_len = committed + 1
+                    if alloc_end > committed:
+                        self.cache_manager.free_spec_tail(req.table_idx, committed, alloc_end)
+                    spec_row += span
+                    req.append_host(new_tokens)
+                else:
+                    new_tokens = next_tokens_cpu[i].unsqueeze(0)
+                    req.append_host(new_tokens)
+                finished = False
+                finish_reason = None
+                for next_token_t in new_tokens:
+                    next_token = int(next_token_t)
+                    # EOS / stop-string -> "stop", output budget exhausted -> "length";
+                    # EOS and stop strings win over length.
+                    hit_length = not req.can_decode
+                    hit_eos = (
+                        not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
                     )
-                )
+                    matched_stop = (
+                        self._match_stop_str(req)
+                        if not hit_eos and req.sampling_params.stop_strs
+                        else None
+                    )
+                    finished = hit_length or hit_eos or matched_stop is not None
+                    finish_reason = (
+                        ("stop" if (hit_eos or matched_stop is not None) else "length")
+                        if finished
+                        else None
+                    )
+                    if (
+                        next_token == self.toolcall_anchor_id
+                        and req.toolcall_anchor_len is None
+                        and not finished
+                    ):
+                        req.toolcall_anchor_len = req.input_ids.numel()
+                    reply.append(
+                        DetokenizeMsg(
+                            uid=req.uid,
+                            next_token=next_token,
+                            finished=finished,
+                            finish_reason=finish_reason,
+                            matched_stop=matched_stop,
+                            stop_strs=req.sampling_params.stop_strs or None,
+                        )
+                    )
+                    if finished:
+                        break  # tokens after the finisher are trimmed client-side
 
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
                 if finished and req not in self.finished_reqs:
@@ -911,7 +963,15 @@ class Scheduler(SchedulerIOMixin):
         # mm_rope_delta for RoPE; the token-pool gather must index the UNshifted
         # [cached_len, device_len) span the prefill writer used, or it reads
         # past-the-row garbage (only mm reqs have delta != 0).
-        if any(getattr(r, "mm_rope_delta", 0) for r in batch.padded_reqs):
+        if batch.spec_num_draft_tokens:
+            # Spec cycle: the verify input is [staged token, drafted tokens...] — only the
+            # staged token (slot cached_len, the first row of each request's span) comes
+            # from the token pool; the drafts live in the engine's draft registers and
+            # the speculator assembles the full input itself.
+            rows, cols = input_mapping
+            firsts = _first_slot_flat_indices(batch, device=rows.device)
+            batch.input_ids = self.token_pool[rows[firsts], cols[firsts]]
+        elif any(getattr(r, "mm_rope_delta", 0) for r in batch.padded_reqs):
             rows = input_mapping[0]
             cols = torch.cat([
                 torch.arange(r.cached_len, r.device_len, device=rows.device, dtype=rows.dtype)
@@ -923,9 +983,35 @@ class Scheduler(SchedulerIOMixin):
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
         forward_output = self.engine.forward_batch(batch, sample_args)
-        self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+        from freetoken.engine.spec import SpecForwardOutput  # lazy: engine pkg is heavy
+
+        if isinstance(forward_output, SpecForwardOutput):
+            # Vectorized commit of the verify argmax: row j of each request's span lands
+            # in token_pool slot [cached_len + 1 + j] — the accepted drafts plus the
+            # bonus/correction token at the accepted boundary. Rejected rows write into
+            # slots later cycles always overwrite before reading. Rows whose shifted slot
+            # falls past the pool width (a request that consumed its whole output budget)
+            # are skipped: the drain re-points the request below and never reads them.
+            rows, cols = input_mapping
+            write_cols = cols + 1
+            in_pool = write_cols < self.token_pool.shape[1]
+            self.token_pool[(rows[in_pool], write_cols[in_pool])] = (
+                forward_output.argmax_gpu[in_pool]
+            )
+        else:
+            self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
+
+
+def _first_slot_flat_indices(batch: Batch, device: torch.device) -> torch.Tensor:
+    """Flat row index of each (padded) request's first verify token in the batch's
+    per-token layout (spans of extend_len rows in padded_reqs order)."""
+    lens = [req.extend_len for req in batch.padded_reqs]
+    offsets = [0]
+    for length in lens[:-1]:
+        offsets.append(offsets[-1] + length)
+    return torch.tensor(offsets, dtype=torch.int64, device=device)
 
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:

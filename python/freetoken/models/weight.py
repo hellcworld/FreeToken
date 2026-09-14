@@ -12,6 +12,7 @@ module; otherwise the defaults below (built purely from the parsed config) apply
 from __future__ import annotations
 
 import glob
+import inspect
 import json
 import mmap
 import os
@@ -225,6 +226,7 @@ def load_weight(
     device: torch.device,
     *,
     include_moe_experts: bool = True,
+    include_mtp: bool = False,
 ) -> Iterator[Tuple[str, torch.Tensor]]:
     # FTW checkpoint: dense weights are stored post-iter_weights, so we replay them
     # model-agnostically instead of re-running the per-model reader. Which tensors exist is
@@ -248,11 +250,18 @@ def load_weight(
 
     _config, spec = _spec_for_model_path(model_path)
     iter_weights = _load_attr(spec.module, spec.iter_weights)
+    kwargs: dict = {}
+    if include_mtp:
+        # Only model readers that learned about the MTP head accept the flag (qwen3_5_moe
+        # in-tree); every other iterator keeps its exact signature.
+        if "include_mtp" in inspect.signature(iter_weights).parameters:
+            kwargs["include_mtp"] = True
     yield from iter_weights(
         model_path,
         device,
         include_moe_experts=include_moe_experts,
         include_non_moe=True,
+        **kwargs,
     )
 
 

@@ -395,6 +395,16 @@ class Engine:
         # ======================= Sampler initialization ========================
         self.sampler = Sampler(self.device, config.model_config.vocab_size)
 
+        # ======================= MTP speculator initialization ========================
+        # Built only when _adjust_config enabled the draft head; owns the hidden stash and
+        # the draft+verify cycle (see engine.spec). Created before graph capture so the
+        # prefill warmup below exercises the MTP prefill hook's kernels too.
+        self.spec = None
+        if getattr(config.model_config, "enable_mtp", False):
+            from .spec import MTPSpeculator
+
+            self.spec = MTPSpeculator(self, config.speculative_num_draft_tokens)
+
         post_free_memory = self._sync_get_memory()[0]
         logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
 
@@ -469,6 +479,7 @@ class Engine:
                 config.model_path,
                 self.device,
                 include_moe_experts=not is_offload_moe_backend(config.moe_backend),
+                include_mtp=getattr(config.model_config, "enable_mtp", False),
             ),
             device=self.device,
         )
@@ -692,8 +703,15 @@ class Engine:
                 f"(MoE layer {type(sample).__name__} is missing {required})."
             )
         # Decode batches never exceed max_running_req, but CUDA-graph padding can
-        # round a batch up to the largest captured size; cover both.
+        # round a batch up to the largest captured size; cover both. MTP verify
+        # cycles carry (K+1) rows per request through the same executor — and they
+        # run EAGER (never graph-padded), so the bound is requests x span.
         max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, 1)
+        if getattr(config.model_config, "enable_mtp", False):
+            max_tokens = max(
+                max_tokens,
+                config.max_running_req * (config.speculative_num_draft_tokens + 1),
+            )
         # gpt-oss mxfp4 carries clamped-swiglu scalars; other formats use the defaults.
         executor = CpuMoeExecutor(
             cache,
@@ -919,11 +937,23 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        if self.spec is not None and batch.spec_num_draft_tokens:
+            return self.spec.forward_batch(batch)
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
+                # Graph replay never runs model.forward, so _last_hidden is stale —
+                # skip the stash refresh (quality-only, but keep it honest).
             else:
                 logits = self.model.forward()
+                if self.spec is not None and batch.is_decode:
+                    self.spec.note_decode(batch)
+            if self.spec is not None and batch.is_prefill:
+                # Prefill chunk: fill the draft head's KV slab in lockstep (inside the
+                # batch ctx — the draft layer rides the same attn metadata) and refresh
+                # the hidden stash. Runs for the startup warmup batches too, so the
+                # draft layer's Triton kernels compile before the first real request.
+                self.spec.note_prefill(batch)
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
@@ -1372,6 +1402,83 @@ def _adjust_config(config: EngineConfig):
                 "(or auto, which resolves to it) or drop the flag."
             )
     _validate_attention_backend_choice(config, override, required_attn_types)
+
+    # MTP speculative decoding (--speculative-algorithm MTP). Runs here because this
+    # function is the engine's FIRST model_config accessor: flipping enable_mtp below is
+    # what makes the model build the draft head, the loader keep the ``mtp.*`` weights and
+    # the KV pool allocate the draft layer's slab — every later consumer sees the final
+    # state. Phase-1 scope: plain MHA/GQA Qwen3.5-family checkpoints, Triton backend, TP=1.
+    _spec_algo = getattr(config, "speculative_algorithm", None)
+    if _spec_algo is not None:
+        if _spec_algo != "MTP":
+            raise ValueError(
+                f"--speculative-algorithm {_spec_algo!r}: only 'MTP' is supported."
+            )
+        if config.tp_info.size != 1:
+            raise ValueError(
+                "--speculative-algorithm MTP currently requires TP=1 (the draft head "
+                "is built with replicated linears)."
+            )
+        if getattr(model_config, "num_mtp_layers", 0) <= 0:
+            raise ValueError(
+                "--speculative-algorithm MTP: this checkpoint declares no MTP layers "
+                "(text_config.mtp_num_hidden_layers missing/0); there is no draft head "
+                "to load."
+            )
+        from freetoken.checkpoint.ftw import is_ftw_checkpoint
+
+        if is_ftw_checkpoint(config.model_path):
+            raise ValueError(
+                "--speculative-algorithm MTP does not yet support FTW checkpoints (the "
+                "converted dense shard would need to contain the mtp.* tensors); serve "
+                "the safetensors checkpoint instead."
+            )
+        if model_config.is_multimodal:
+            raise ValueError(
+                "--speculative-algorithm MTP does not yet support multimodal builds "
+                "(the MTP prefill hook re-embeds text tokens only); drop "
+                "FREETOKEN_LOAD_VISION."
+            )
+        if getattr(model_config, "expert_quant", "none") == "fp8_block" and model_config.moe_enabled:
+            raise ValueError(
+                "--speculative-algorithm MTP: block-fp8 MoE checkpoints ship the draft "
+                "head's experts in a layout the resident bf16 draft MoE does not load "
+                "yet; serve the NVFP4 (modelopt) build instead."
+            )
+        if has_swa_attention or is_dsv4:
+            raise ValueError(
+                "--speculative-algorithm MTP does not yet support SWA or DSV4 models: "
+                "the draft head's KV slab would live in the windowed/DSV4 pool family, "
+                "whose per-layer bookkeeping the speculator does not extend yet. "
+                "(GDN-hybrid models ARE supported: their recurrent state is snapshotted "
+                "before the verify pass and restored on rejected drafts.)"
+            )
+        for _spec in model_config.kv_cache_group_specs():
+            if _spec.mla or getattr(_spec, "index_head_dim", 0):
+                raise ValueError(
+                    "--speculative-algorithm MTP is unsupported for MLA/DSA/BSA models."
+                )
+        _parts = [p.strip() for p in config.attention_backend.split(",")]
+        if any(p != "triton" for p in _parts):
+            # The draft/verify path rides the Triton extend kernels (multi-query paged
+            # attention with intra-block causal masking). Other backends' verify support
+            # is unvalidated in phase 1 — route everything through triton.
+            override("attention_backend", "triton")
+            logger.info_rank0(
+                "MTP speculation forces the Triton attention backend "
+                f"(was {config.attention_backend!r}): the verify pass reuses its "
+                "multi-query extend kernels."
+            )
+        if config.speculative_num_draft_tokens < 1:
+            raise ValueError(
+                f"--speculative-num-draft-tokens must be >= 1, got "
+                f"{config.speculative_num_draft_tokens}."
+            )
+        object.__setattr__(model_config, "enable_mtp", True)
+        logger.info_rank0(
+            f"MTP speculative decoding enabled: {config.speculative_num_draft_tokens} "
+            "draft token(s) per cycle, verified in one target forward (lossless, greedy)."
+        )
 
     if config.moe_cache_rate is not None:
         total_experts = config.model_config.num_moe_layers * config.model_config.num_experts

@@ -187,7 +187,14 @@ class GraphRunner:
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
-        return batch.is_decode and batch.size <= self.max_graph_bs
+        # Spec verify batches are decode-phase but carry K+1 query tokens per request —
+        # a shape the bs x 1 decode graphs cannot replay (they run eager through the
+        # multi-query extend kernels instead).
+        return (
+            batch.is_decode
+            and not batch.spec_num_draft_tokens
+            and batch.size <= self.max_graph_bs
+        )
 
     def replay(self, batch: Batch) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)

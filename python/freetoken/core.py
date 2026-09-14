@@ -137,6 +137,15 @@ class Batch:
     active_table_idx: "torch.Tensor | None" = None
     # this field should be set by attention backend
     attn_metadata: BaseAttnMetadata = field(init=False)
+    # MTP speculative decoding: number of DRAFT tokens this decode cycle verifies (0 on
+    # every non-spec batch). Set by the DecodeManager at schedule time; the engine's
+    # speculator reads it to run the draft loop + verify pass instead of the plain
+    # single-token decode tail.
+    spec_num_draft_tokens: int = field(default=0, init=False)
+    # (cached_len, device_len) per request snapshotted at SCHEDULE time. The speculator
+    # must not read the live Req lens: the overlap loop may drain the previous batch
+    # (advancing them) between scheduling and launching this one.
+    spec_req_lens: list | None = field(default=None, init=False)
     # concatenated multimodal soft-token embeddings for a prefill batch (or None)
     mm_embeds: torch.Tensor | None = field(default=None, init=False)
     # [3, N] interleaved-mRoPE rows for a multimodal prefill batch (or None); row 0
@@ -183,6 +192,13 @@ class Context:
     # Per-request recurrent state for GatedDeltaNet layers; set by the engine for
     # hybrid linear-attention models, otherwise None.
     linear_state_pool: LinearStatePool | None = None
+    # MTP draft-head flag: True while the MTP layer replays a prefill chunk KV-only
+    # (its MLP half is dead compute there). Managed by Qwen3_5MTPHead.prefill.
+    _mtp_kv_only: bool = field(default=False, init=False)
+    # MTP verify-pass scratch (engine.spec._SpecVerify) while the target forward of a
+    # spec cycle runs: per-layer GDN intermediate states + conv-input captures. The
+    # GDN layers write into it; the speculator consumes it after acceptance.
+    _spec_verify: object = field(default=None, init=False)
     _batch: Batch | None = field(default=None, init=False)
 
     @property

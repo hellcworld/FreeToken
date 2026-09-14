@@ -374,6 +374,11 @@ def parse_config(hf_config: Any) -> ModelConfig:
         attn_quant=attn_quant,
         dense_quant=dense_quant,
         lm_head_quant=lm_head_quant,
+        # Trailing MTP draft head (DeepSeek-style: an eh_proj + one full-attention decoder
+        # layer sharing the target embedding/lm_head). The weights stay dropped at load
+        # unless the engine enables speculation (enable_mtp); only that path builds the
+        # draft module, so text-only serving never pays its VRAM.
+        num_mtp_layers=int(getattr(text, "mtp_num_hidden_layers", 0) or 0),
     )
 
 

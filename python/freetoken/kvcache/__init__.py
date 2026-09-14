@@ -159,15 +159,29 @@ def create_kvcache_pool(
         specs = [s for s in model_config.kv_cache_group_specs() if s.num_layers > 0]
         assert len(specs) == 1, f"expected one paged-KV group, got {[s.name for s in specs]}"
         spec = specs[0]
-        layer_ids = spec.layer_ids
+        layer_ids = list(spec.layer_ids)
         num_kv_heads = spec.num_kv_heads
         head_dim = spec.head_dim
+    else:
+        layer_ids = None
+    # MTP draft layers own slabs too (always full-attention, even on hybrid models).
+    mtp_ids = tuple(getattr(model_config, "mtp_layer_ids", ()) or ())
+    if mtp_ids:
+        layer_ids = None if layer_ids is None else tuple(layer_ids) + mtp_ids
 
     # Latent-KV MLA models declare it on their single full-attention group: they get
     # the latent pool (one slab, V aliases K), plus the DSA index-key slab when the
     # spec carries indexer dims. The same spec fields drive the KV cost model, so the
     # factory and the budget can never disagree.
     kv_specs = model_config.kv_cache_group_specs()
+
+    # MTP speculative decoding: the draft head's attention layers own one extra slab each
+    # (global ids [num_layers, num_layers + num_mtp_layers)), addressed through the same
+    # page table so allocation/rollback ride the existing machinery. Only reached for the
+    # plain MHA family — Engine._adjust_config rejects every other pool family for spec.
+    num_pool_layers = model_config.num_layers + len(
+        getattr(model_config, "mtp_layer_ids", ()) or ()
+    )
 
     # GQA block-sparse (MiniMax-M3): one full-attention group carrying the index dims
     # with mla=False -> the MHA pool plus the index-key slab. The same spec fields
@@ -218,7 +232,7 @@ def create_kvcache_pool(
         num_kv_heads=num_kv_heads,
         num_pages=num_pages,
         page_size=page_size,
-        num_layers=model_config.num_layers,
+        num_layers=num_pool_layers,
         head_dim=head_dim,
         device=device,
         dtype=dtype,

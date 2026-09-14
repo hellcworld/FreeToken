@@ -27,7 +27,7 @@
 
 ## ✨ 本 Fork 新增能力
 
-在上游 `main@2757bb5` 之上叠加三个功能(详情与验证:[CHANGES.md](CHANGES.md)):
+在上游 `main@2757bb5` 之上叠加四个功能(详情与验证:[CHANGES.md](CHANGES.md)):
 
 **1 · Qwen3.8-27B NVFP4 支持——两种量化方言**
 
@@ -72,6 +72,18 @@ ft serve --model Qwen/Qwen3.5-35B-A3B --kv-cache-dtype fp8_e4m3   # KV 容量约
 kernel 内反量化(写入侧单步 RNE 量化;读取侧 bf16 dot + fp32 累加,量化是
 唯一误差源,近无损)。需 CUDA + bfloat16 + Triton 后端 + 纯 MHA/GQA 模型,
 其余组合在启动时直接报错。
+
+**4 · MTP 投机解码(`--speculative-algorithm MTP`)**
+
+```bash
+ft serve --model Qwen3.8-27B --speculative-algorithm MTP --speculative-num-draft-tokens 2
+```
+加载 Qwen3.5/3.6/3.8 checkpoint 自带的 MTP 草稿头(上游在加载时丢弃 `mtp.*`
+分片),执行草稿-验证:每步自回归草稿 K 个 token,目标模型一次 forward 验证。
+**greedy 输出与不开投机逐 token 一致(数学无损)**——该一致性即 e2e 测试判据。
+草稿头持有共享页表下的独立 KV slab,前缀缓存复用、页分配与拒绝回滚全部复用
+现有机制。phase 1 范围:纯 MHA/GQA 的 Qwen3.5 家族稠密模型、Triton 后端、TP=1;
+非 greedy 请求自动降级为普通周期。
 
 ## 简介
 

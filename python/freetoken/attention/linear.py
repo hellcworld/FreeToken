@@ -53,6 +53,11 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
     CUDA graph the decode ``FLAMetadata`` is instead built directly in
     ``GraphCaptureBuffer.set_batch`` against the persistent buffers (stable addresses); this
     builder serves the eager scheduler path and direct-op test callers.
+
+    MTP verify batches carry K+1 rows per request while staying phase "decode"; they route
+    through the ragged prefill-style branch below — exactly the multi-token continuation
+    semantics verification needs (each request's state advances once over its span). The
+    anchor-tracking h snapshots stay a prefill-only feature (off for verify batches).
     """
     reqs = batch.padded_reqs
     pin = {"device": "cpu", "pin_memory": True}
@@ -62,7 +67,7 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
     def gdn_slot(r):
         return r.linear_slot_idx if r.linear_slot_idx is not None else r.table_idx
 
-    if batch.is_decode:
+    if batch.is_decode and all(r.extend_len == 1 for r in reqs):
         bs = len(reqs)
         cu_seqlens = torch.arange(bs + 1, dtype=torch.int32, device=device)
         # the scheduler stages linear_table_idx from gdn_slot (decode), reused as-is here
@@ -77,7 +82,12 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
     fresh = [gdn_slot(r) for r in reqs if r.cached_len == 0]
     fresh_host = torch.tensor(fresh, dtype=torch.int64, **pin) if fresh else None
 
-    track_dst, track_h_row, track_conv_src = _build_track_metadata(reqs, cu_host, device, pin)
+    if batch.is_decode:
+        # Spec verify batch (decode phase, ragged rows): the mid-chunk h snapshots feed
+        # the prefill-side anchor/cache machinery and have no decode counterpart.
+        track_dst = track_h_row = track_conv_src = None
+    else:
+        track_dst, track_h_row, track_conv_src = _build_track_metadata(reqs, cu_host, device, pin)
 
     return FLAMetadata(
         cu_seqlens=cu_host.to(device, non_blocking=True),

@@ -25,7 +25,7 @@ Unlock datacenter-class intelligence on the hardware you already own — Run 290
 
 ## ✨ What's New in This Fork
 
-Three features layered on upstream `main@2757bb5` (details & verification: [CHANGES.md](CHANGES.md)):
+Four features layered on upstream `main@2757bb5` (details & verification: [CHANGES.md](CHANGES.md)):
 
 **1 · Qwen3.8-27B NVFP4 support — both quant dialects**
 
@@ -82,6 +82,24 @@ inside the Triton attention kernels (RNE-quantized on store; bf16 dot + fp32
 accumulate on read, so quantization is the only error source — near-lossless).
 Needs CUDA + bfloat16 + the Triton backend + a plain MHA/GQA model; every other
 combination fails loudly at startup.
+
+**4 · MTP speculative decoding (`--speculative-algorithm MTP`)**
+
+```bash
+ft serve --model Qwen3.8-27B --speculative-algorithm MTP --speculative-num-draft-tokens 2
+```
+Loads the MTP draft head that every Qwen3.5/3.6/3.8 checkpoint ships (upstream drops
+the `mtp.*` shard at load) and runs draft-then-verify: K chained draft tokens per step,
+verified by one target forward. **Greedy output is token-identical to non-speculative
+decoding** (mathematically lossless — that identity is the e2e test). The draft head
+keeps its own paged-KV slab behind the shared page table, so prefix-cache reuse, page
+allocation and rejected-draft rollback ride the existing machinery; GDN-hybrid models
+(Qwen3.5/3.6/3.8 are 48 linear + 16 full) are covered via recurrent-state
+snapshot/restore around the verify pass. Phase-1 scope: dense Qwen3.5-family
+checkpoints, Triton backend, TP=1; non-greedy requests automatically fall back to
+plain cycles. GPU-validated on RTX 3060 + WSL2: greedy outputs token-identical
+plain vs spec (lossless), 1.28x throughput at K=2 even with a random-weight draft
+head (zero acceptance still nets out ahead via verify-pass row amortization).
 
 ## About
 

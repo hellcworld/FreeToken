@@ -131,11 +131,24 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
                 tie_word_embeddings=config.tie_word_embeddings,
                 tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
             )
+        if getattr(config, "enable_mtp", False) and config.num_mtp_layers > 0:
+            # MTP speculative decoding (--speculative-algorithm MTP): build the draft head
+            # only when the engine enabled it (Engine._adjust_config flips enable_mtp), so
+            # plain serving never pays its VRAM. Its attention layers own KV slabs
+            # [num_layers, num_layers + num_mtp_layers) in the shared pool.
+            from .mtp import Qwen3_5MTPHead
+
+            assert config.num_mtp_layers == 1, "only the single-layer MTP head is supported"
+            self.mtp = Qwen3_5MTPHead(config, layer_id=config.num_layers)
+            self.mtp.mount_embedding(self.model.embed_tokens)
+        # Last forward's pre-lm_head hidden states [T, H]; the MTP speculator reads the
+        # per-request tail rows from it (draft input pairing / decode-time stash).
+        self._last_hidden: torch.Tensor | None = None
         super().__init__()
 
     def forward(self) -> torch.Tensor:
-        output = self.model.forward(get_global_ctx().batch.input_ids)
-        return self.lm_head.forward(output)
+        self._last_hidden = self.model.forward(get_global_ctx().batch.input_ids)
+        return self.lm_head.forward(self._last_hidden)
 
     @torch.inference_mode()
     def encode_images(

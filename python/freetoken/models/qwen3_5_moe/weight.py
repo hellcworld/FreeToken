@@ -206,7 +206,58 @@ def _try_fuse(
     return None
 
 
+def _iter_mtp_weights(
+    model_path: str, device: torch.device
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Dense pass for the checkpoint's trailing MTP head (``mtp.*``; DeepSeek-style:
+    ``fc`` eh_proj + ``pre_fc_norm_{embedding,hidden}`` + one full-attention decoder layer
+    + final ``norm``, sharing the target embedding/lm_head).
+
+    Every in-tree dialect (bf16, modelopt NVFP4/mixed, compressed-tensors) ships the MTP
+    head UN-quantized bf16 in a dedicated shard, so this pass bypasses the per-dialect
+    quant machinery entirely and only reuses the shared projection fusions (q/k/v ->
+    ``qkv_proj``, dense gate/up -> ``gate_up_proj``) and the Gemma (1+w) norm baking —
+    which by suffix covers exactly the decoder layer's own norms; the head-level
+    ``mtp.norm`` / ``mtp.pre_fc_norm_*`` are standard RMSNorms and pass through raw."""
+    fuse_buf: dict[str, dict[int, torch.Tensor]] = {}
+    for file in iter_weight_files(model_path):
+        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            for raw_name in f.keys():
+                if not raw_name.startswith("mtp."):
+                    continue
+                if raw_name.endswith(_SCALE_SUFFIXES):
+                    continue  # not shipped today; guard against future quantized exports
+                tensor = f.get_tensor(raw_name)
+                fused = _try_fuse(raw_name, tensor, fuse_buf)
+                if fused is not None:
+                    if fused != ():  # () means buffered, not yet complete
+                        yield fused
+                    continue
+                if _is_gemma_norm(raw_name):
+                    tensor = tensor + 1.0  # (1 + weight) baked into the stored norm weight
+                yield raw_name, tensor
+    assert not fuse_buf, f"Incomplete MTP projection fusions: {list(fuse_buf.keys())}"
+
+
 def iter_weights(
+    model_path: str,
+    device: torch.device,
+    *,
+    include_moe_experts: bool,
+    include_non_moe: bool,
+    include_mtp: bool = False,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Dense weights across every Qwen3.5 dialect, plus (``include_mtp``) the trailing MTP
+    head. Kept as a wrapper so the MTP pass appends to ALL dialect paths uniformly."""
+    yield from _iter_dense_weights(
+        model_path, device,
+        include_moe_experts=include_moe_experts, include_non_moe=include_non_moe,
+    )
+    if include_mtp:
+        yield from _iter_mtp_weights(model_path, device)
+
+
+def _iter_dense_weights(
     model_path: str,
     device: torch.device,
     *,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
@@ -172,10 +173,12 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         z = z.reshape(total, self.num_v_heads, self.head_v_dim)
         li = pool.local_index(self.layer_id)
 
-        if batch.is_decode:
+        if batch.is_decode and total == len(batch.padded_reqs):
             # Fused fla decode kernel: gating + in-kernel l2norm + recurrent update +
             # per-request state read/write-by-index, all in one kernel (no gather/scatter,
             # no clone, no external l2norm). q/k stay at num_k_heads (kernel handles GQA).
+            # MTP verify batches are phase "decode" but carry K+1 rows per request —
+            # total != bs routes them to the verify branch below.
             mixed = self._conv_decode(conv_in, fla.cache_indices, pool)  # [B, conv_dim]
             B = mixed.shape[0]
             qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
@@ -187,6 +190,44 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                 state_source=pool.recurrent_states[li], indices=fla.cache_indices,
                 cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
             )
+        elif batch.is_decode:
+            # MTP verify: decode-phase batch with K+1 rows per request. The recurrent
+            # kernel runs in target_verify mode — the LIVE slot is not written (the
+            # final state would reflect ALL K+1 rows, but only n+1 get committed); the
+            # per-step states land in the speculator's intermediate buffer instead,
+            # and the speculator scatters step n back into the slot after acceptance.
+            # T=K+1 <= 8 keeps the sequential per-token loop cheap (prefill's chunk
+            # kernel wins only at long T).
+            sv = ctx._spec_verify
+            assert sv is not None, "multi-row decode batch outside a spec cycle"
+            mixed = self._conv_prefill(
+                conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
+            # The varlen conv leaves the state at the END of the whole span; the
+            # speculator rebuilds the committed-boundary window from these rows.            sv.conv_capture[li] = conv_in
+            qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+            # _conv_prefill returns a TRANSPOSED view ([conv_dim, total] memory), so the
+            # reshapes below are semantically-valid but NON-token-major views — and the
+            # recurrent kernel indexes tokens via stride(1) only, assuming contiguous
+            # head/dim axes. Materialize token-major copies or the kernel reads misaligned
+            # memory. (The prefill chunk kernel takes full strides; the decode conv output
+            # is already contiguous — only this path needs it.)
+            q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).contiguous().to(dtype)
+            k = kf.reshape(1, total, self.num_k_heads, self.head_k_dim).contiguous().to(dtype)
+            v = vf.reshape(1, total, self.num_v_heads, self.head_v_dim).contiguous().to(dtype)
+            from freetoken.kernel.fla import fused_sigmoid_gating_delta_rule_update
+            o = fused_sigmoid_gating_delta_rule_update(
+                A_log=self.A_log, a=a, dt_bias=self.dt_bias,
+                softplus_beta=1.0, softplus_threshold=20.0,
+                q=q, k=k, v=v, b=b,
+                initial_state_source=pool.recurrent_states[li],
+                initial_state_indices=fla.cache_indices,
+                scale=self.head_k_dim ** -0.5, use_qk_l2norm_in_kernel=True,
+                cu_seqlens=fla.cu_seqlens,
+                disable_state_update=True,
+                intermediate_states_buffer=sv.ssm_buffer[li],
+                intermediate_state_indices=sv.ssm_indices,
+            )
+            core_out = o[0]
         else:
             mixed = self._conv_prefill(
                 conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)

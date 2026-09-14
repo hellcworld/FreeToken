@@ -131,6 +131,20 @@ class MHAKVCache(BaseKVCachePool):
             for spec in config.model_config.kv_cache_group_specs()
             if not spec.is_swa
         )
+        # MTP draft head: its attention layers each hold one more full-attention slab.
+        # spec_kv_bytes_per_token prices a WHOLE group (x spec.num_layers), so derive the
+        # per-layer cost before charging the draft slabs -- charging the group total
+        # per draft layer overprices KV by the full group's layer count (16x on a
+        # 16-of-64-full hybrid like Qwen3.8-27B).
+        mtp_ids = getattr(config.model_config, "mtp_layer_ids", ())
+        if mtp_ids:
+            full = next(
+                spec
+                for spec in config.model_config.kv_cache_group_specs()
+                if not spec.is_swa
+            )
+            per_layer = spec_kv_bytes_per_token(full, config) // max(full.num_layers, 1)
+            per_token += len(mtp_ids) * per_layer
         return per_token * config.page_size, 0, config.page_size, 0
 
     def rebuild_from_config(
