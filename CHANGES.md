@@ -261,6 +261,32 @@ token ~10s 排队即此因)。`Scheduler._policy_pick_batch` 实现三策略,记
 不可控(spec 路径历史上每轮深挖审计都修出严重 bug),留待有 GPU 的会话按备忘
 实现。
 
+### 5.5 RTX 3060 12GB + WSL2 实机 A/B(2026-09-15,116 盒子,nvidia/Qwen3.6-35B-A3B-NVFP4)
+
+部署 `0.1.2+g77d40585b`(fp8 KV + max_running=2 + moe-cache-auto=1859 槽 + auto 18 层
+CPU 锁定),3×255 token 流式取中位;双流 = 正在解码的请求 A vs +4s 到达的 16.5K
+token 新请求 B:
+
+| 配置 | 单流 decode | A 最大停顿 | B TTFT | 备注 |
+|---|---|---|---|---|
+| 基线(prefill_first, chunk 8192) | **27.2 tok/s** | **15.66s** | 29.9s | 命中率 91-96% 波动对 tok/s 无感 |
+| --moe-backend hybrid | 23.8 tok/s(-12%) | - | - | 与 benchbw 预测一致(CPU/PCIe 比 1.045<2),否决 |
+| --moe-cpu-layers 0 | 加载期崩溃 | - | - | bank 页注册路径在 WSL 上硬崩(无栈,疑 dxg 同族),否决 |
+| interleave, chunk 8192 | 27.2 tok/s | 13.12s | 25.9s | 交替只能在 chunk 边界挤 1 token/chunk |
+| interleave, chunk 2048 | 27.0 tok/s | **5.77s(-63%)** | 40.9s(+37%) | 多客户端 agent 推荐 |
+
+- **瓶颈定位**:96% 命中率下 PCIe miss 仅 ~1.8ms/37ms 步(0.32 miss/层 × 1.78MB
+  槽),单流 27 tok/s 的实际上限是 18 层 CPU 锁定 MoE 计算(WSL pin 配额 9.39GB <
+  banks 16.93GB 的强制拆分);缓存再平衡、GDN 状态 bf16 对单流 decode 均无感。
+- **MTP 在此机不可用**:116 即第四节记录的 WSL 验证机,35B spec 的异步非法 access
+  未根治前不要在此开启;spec 图捕获/overlap 恢复见 docs/spec-graph-design.md。
+- **运维根因**:WSL 在最后一个会话退出后随之关闭,ftserve 约 10 分钟的冷加载被
+  反复 SIGTERM(9-14 晚 21 点的"崩溃循环"与"服务经常是死的"皆此因)。需 Windows
+  侧常驻会话保活;临时手段:后台挂 `wsl -d Ubuntu -- bash -c 'while true; do
+  sleep 30; done'`。
+- 部署工具链:diagnostics/rexec.py(paramiko,FT116_PW 环境变量)+ box_*.sh/py
+  A/B 脚本(改 /etc/default/ftserve → 重启 → 1-token 探针等就绪 → 测速)。
+
 ## 版本说明 / Versioning
 
 - 本 fork 标签:**`qwen38-vision-v1.0.0`**(见 git tag)
