@@ -36,6 +36,12 @@ class StatsTracker:
         self.mamba_total_slots = 0
         self.swa_used_tokens = 0
         self.swa_total_tokens = 0
+        # Last-known MoE expert-cache miss window (only reported under
+        # --moe-collect-stats). miss_rate -1.0 = never reported.
+        self.moe_miss_rate = -1.0
+        self.moe_active_per_layer = 0.0
+        self.moe_missing_per_layer = 0.0
+        self.moe_fetch_rate = -1.0
         self.vram_bytes = 0
 
     @property
@@ -72,6 +78,11 @@ class StatsTracker:
         if getattr(reply, "swa_total_tokens", 0) > 0:  # SWA (window pool) only
             self.swa_used_tokens = reply.swa_used_tokens
             self.swa_total_tokens = reply.swa_total_tokens
+        if getattr(reply, "moe_miss_rate", -1.0) >= 0:  # --moe-collect-stats windows only
+            self.moe_miss_rate = reply.moe_miss_rate
+            self.moe_active_per_layer = reply.moe_active_per_layer
+            self.moe_missing_per_layer = reply.moe_missing_per_layer
+            self.moe_fetch_rate = reply.moe_fetch_rate
         if getattr(reply, "gpu_mem_bytes", 0) > 0:
             self.vram_bytes = reply.gpu_mem_bytes
         if getattr(reply, "finished", False):
@@ -129,7 +140,8 @@ def _swa_page_size(config: Any) -> int:
 
 def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
     """Full /v1/stats doc. throughput is 0 when idle; kv/mamba/swa are null
-    when their total is 0 (owned-KV / non-hybrid / non-SWA). kv and swa share one shape:
+    when their total is 0 (owned-KV / non-hybrid / non-SWA); moe is null until a
+    --moe-collect-stats window is reported. kv and swa share one shape:
     pages + the pool's own page_size (tokens = pages x page_size). gpus: the engine's GPU as
     [{index, name, uuid, total_bytes}] (the primary rank's; a list so TP can extend it), []
     until the readiness meta arrives."""
@@ -152,6 +164,19 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
          "page_size": sps}
         if tr.swa_total_tokens > 0 else None
     )
+    # Expert-cache miss window under --moe-collect-stats; None when never reported
+    # (flag off / fused backend / no decode window closed yet). hit_rate is the
+    # complement of miss_rate, spelled out for cache-sizing decisions.
+    moe = (
+        {"miss_rate": round(tr.moe_miss_rate, 4),
+         "hit_rate": round(1.0 - tr.moe_miss_rate, 4),
+         "active_per_layer": round(tr.moe_active_per_layer, 2),
+         "missing_per_layer": round(tr.moe_missing_per_layer, 2),
+         # hybrid only: share of misses fetched over PCIe (the CPU computed the rest);
+         # None for plain offload where every miss is a PCIe fetch.
+         "fetch_rate": round(tr.moe_fetch_rate, 4) if tr.moe_fetch_rate >= 0 else None}
+        if tr.moe_miss_rate >= 0 else None
+    )
     return {
         "instance_id": getattr(state, "instance_id", None),
         "model": derive_model_card(config),
@@ -159,6 +184,7 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
         "kv": kv,
         "mamba": mamba,
         "swa": swa,
+        "moe": moe,
         "vram_bytes": tr.vram_bytes,
         "gpus": list(getattr(state, "gpus", None) or []),
         "throughput": {

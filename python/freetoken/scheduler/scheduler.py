@@ -140,6 +140,8 @@ class Scheduler(SchedulerIOMixin):
             log=logger.info_rank0,
             decode_log_interval=config.decode_log_interval,
         )
+        # Decode-batch counter delimiting --moe-collect-stats sampling windows.
+        self._moe_stat_batches = 0
 
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
@@ -445,6 +447,7 @@ class Scheduler(SchedulerIOMixin):
         used, total = self._kv_usage_pages()
         mamba_slots = self._mamba_slot_usage()
         swa_tokens = self._swa_token_usage()
+        moe_window = self._moe_miss_window(batch)
         if reply:
             mem = self._gpu_mem_bytes()
             mamba_used, mamba_total = mamba_slots or (0, 0)
@@ -456,6 +459,11 @@ class Scheduler(SchedulerIOMixin):
                 m.mamba_total_slots = mamba_total
                 m.swa_used_tokens = swa_used
                 m.swa_total_tokens = swa_total
+                if moe_window is not None:
+                    m.moe_miss_rate = moe_window["miss_rate"]
+                    m.moe_active_per_layer = moe_window["active_per_layer"]
+                    m.moe_missing_per_layer = moe_window["missing_per_layer"]
+                    m.moe_fetch_rate = moe_window["fetch_rate"]
                 m.gpu_mem_bytes = mem
         self.status_reporter.report_batch(
             batch,
@@ -495,6 +503,30 @@ class Scheduler(SchedulerIOMixin):
         window (swa) tier is reported separately by ``_swa_token_usage``.
         """
         return self.cache_manager.page_usage()
+
+    def _moe_miss_window(self, batch: Batch) -> dict | None:
+        """Sample the MoE expert-cache miss counters once per decode-log window.
+
+        Returns the realized window stats (decode_miss_stats' dict) on the window
+        boundary and resets the counters, else None. The counters only accumulate under
+        --moe-collect-stats (device-side, captured into the decode graph); reading them
+        syncs, so this is called per window (decode_log_interval batches), never per
+        batch. Prefill batches don't touch the decode counters and are skipped.
+        """
+        cache = getattr(self.engine, "moe_offload_cache", None)
+        if (
+            cache is None
+            or not getattr(cache, "collect_stats", False)
+            or not batch.is_decode
+        ):
+            return None
+        self._moe_stat_batches += 1
+        interval = max(1, self.config.decode_log_interval)
+        if self._moe_stat_batches % interval != 0:
+            return None
+        stats = cache.decode_miss_stats()
+        cache.reset_stats()
+        return stats
 
     def _mamba_slot_usage(self) -> Tuple[int, int] | None:
         """(used_slots, total_slots) of the GDN-state (mamba) pool for hybrid models, else None.

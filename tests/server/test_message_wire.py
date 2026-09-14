@@ -101,6 +101,33 @@ def test_detokenize_msg_carries_kv_usage_round_trip():
     assert (decoded.swa_used_tokens, decoded.swa_total_tokens) == (8448, 76800)
 
 
+def test_detokenize_msg_carries_moe_miss_window_round_trip():
+    msg = DetokenizeMsg(
+        uid=4, next_token=7, finished=False,
+        moe_miss_rate=0.25, moe_active_per_layer=8.0,
+        moe_missing_per_layer=2.0, moe_fetch_rate=1.0,
+    )
+    decoded = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
+    assert isinstance(decoded, DetokenizeMsg)
+    assert (decoded.moe_miss_rate, decoded.moe_active_per_layer) == (0.25, 8.0)
+    assert (decoded.moe_missing_per_layer, decoded.moe_fetch_rate) == (2.0, 1.0)
+    # not-reported sentinel survives too (miss can legitimately be 0.0)
+    plain = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(DetokenizeMsg(uid=5, next_token=1, finished=False)))
+    assert plain.moe_miss_rate == -1.0 and plain.moe_fetch_rate == -1.0
+
+
+def test_user_reply_carries_moe_miss_window_round_trip():
+    msg = UserReply(
+        uid=9, incremental_output="t", finished=False,
+        moe_miss_rate=0.0, moe_active_per_layer=8.0,
+        moe_missing_per_layer=0.0, moe_fetch_rate=-1.0,
+    )
+    decoded = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(msg))
+    assert isinstance(decoded, UserReply)
+    assert decoded.moe_miss_rate == 0.0
+    assert decoded.moe_fetch_rate == -1.0
+
+
 def test_client_dicts_with_the_wire_tag_key_survive_intact():
     """Tool JSON Schemas and chat_template_kwargs are free-form client data. A field literally
     named ``__type__`` (a common discriminator) must not be read back as a serialized class --

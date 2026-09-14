@@ -43,6 +43,13 @@ class UserReply(BaseFrontendMsg):
     # Window (swa) pool token usage (used/total) for SWA models, else 0/0.
     swa_used_tokens: int = 0
     swa_total_tokens: int = 0
+    # MoE expert-cache miss stats for the just-closed sampling window (only present on
+    # the window-boundary decode reply, under --moe-collect-stats). miss_rate/fetch_rate
+    # are -1.0 when not reported on this message (miss can legitimately be 0.0).
+    moe_miss_rate: float = -1.0
+    moe_active_per_layer: float = 0.0
+    moe_missing_per_layer: float = 0.0
+    moe_fetch_rate: float = -1.0
     # Bytes the engine process holds on the GPU (torch reserved pool). 0 when not reported.
     gpu_mem_bytes: int = 0
     # Set (with finished=True) when a request failed before producing output — e.g. a chat

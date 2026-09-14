@@ -228,6 +228,10 @@ def tokenize_worker(
                         mamba_total_slots=msg.mamba_total_slots,
                         swa_used_tokens=msg.swa_used_tokens,
                         swa_total_tokens=msg.swa_total_tokens,
+                        moe_miss_rate=msg.moe_miss_rate,
+                        moe_active_per_layer=msg.moe_active_per_layer,
+                        moe_missing_per_layer=msg.moe_missing_per_layer,
+                        moe_fetch_rate=msg.moe_fetch_rate,
                         gpu_mem_bytes=msg.gpu_mem_bytes,
                     )
                     for msg, reply in zip(detokenize_msg, replies, strict=True)

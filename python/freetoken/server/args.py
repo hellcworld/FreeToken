@@ -657,6 +657,19 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-collect-stats",
+        action="store_true",
+        dest="moe_collect_stats",
+        default=ServerArgs.moe_collect_stats,
+        help=(
+            "Accumulate decode expert-cache miss counters on device (captured into the "
+            "CUDA graph). The scheduler samples them per decode-log window and reports "
+            "the realized miss/hit rate in /v1/stats (ft ctl stats) to guide "
+            "--moe-cache-size tuning."
+        ),
+    )
+
+    parser.add_argument(
         "--shell-mode",
         action="store_true",
         help="Run the server in shell mode.",
