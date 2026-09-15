@@ -301,6 +301,18 @@ def parse_config(hf_config: Any) -> ModelConfig:
         attn_quant = "fp8_pertensor" if mixed_fp8 else "nvfp4"
         dense_quant = "nvfp4"
         lm_head_quant = "none"
+        # Debug escape hatch: force the whole dense stack to bf16 (dequant-at-load) to
+        # isolate the W4A16 kernels on untested hardware.
+        import os as _os
+
+        if _os.environ.get("FREETOKEN_CT_DENSE_BF16") == "1":
+            attn_quant = "none"
+            dense_quant = "none"
+        # A ct MoE export (e.g. lyf/Qwen3.6-35B-A3B-*-NVFP4) packs its routed experts
+        # NVFP4 exactly like the modelopt checkpoints -- the bank loader needs the
+        # "nvfp4" provider, not bf16. Dense ct checkpoints (num_experts==0) stay "none".
+        if int(getattr(text, "num_experts", 0) or 0) > 0:
+            expert_quant = "nvfp4"
 
     # Dense variants (e.g. Qwen3.6-27B) report num_experts==0: route the decoder MLP through
     # the dense Qwen3_5DenseMLP instead of the MoE block.

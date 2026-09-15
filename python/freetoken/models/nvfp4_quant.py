@@ -56,7 +56,7 @@ def dequant_nvfp4_reference(
 
 def _round_e2m1_idx(x: torch.Tensor) -> torch.Tensor:
     """Magnitudes (>=0) -> e2m1 magnitude-bin index 0..7, ties away from zero."""
-    edges = torch.tensor((0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0), dtype=torch.float32)
+    edges = torch.tensor((0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0), dtype=x.dtype, device=x.device)
     return torch.bucketize(x, edges, right=False)
 
 

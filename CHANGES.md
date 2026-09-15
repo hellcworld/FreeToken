@@ -305,6 +305,53 @@ token 新请求 B:
   weston 消失、27.2 tok/s 不变;注意 WSL 自动内存配额在重启后会漂移(曾观测
   23GB→15GB),显式 `memory=` 固定是必要的。
 
+## 六、compressed-tensors MoE 检查点支持 + HauhauCS Uncensored 上线(2026-09-16)
+
+目标模型 `HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive` 只发 GGUF(本引擎
+GGUF 仅 gemma4),改用同血统的 ct NVFP4 转换版
+`lyf/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-NVFP4`(Q8_K_P GGUF→bf16→NVFP4,
+22.3 GiB 单文件)。这是本引擎**首个 compressed-tensors MoE** 检查点,加载链路五处缺口:
+
+- **`_rename` 新布局**:transformers 规范命名 `language_model.model.*` → `model.*`
+  (旧代码只认 modelopt 的 `language_model.`/`model.language_model.`,剥一层再补一层产
+  生 `model.model.*` 双前缀,load_state_dict 直接 KeyError)。
+- **config 检测**:ct 方言的 quantization_config 没有 quant_algo/quantized_layers,
+  `expert_quant` 误判 none → 走 bf16 banks;ct + `num_experts>0` 现判 `nvfp4`。
+- **ct 专家 bank**:`Nvfp4ExpertSourceSpec` 字段化(kind_packed/kind_block_scale/
+  kind_global_scale + `global_scale_is_divisor`——llm-compressor 存**除数**
+  (实测 30976),bank 内核要**乘数**(modelopt weight_scale_2 实测 3.2e-5),必须在
+  装载时取倒数);两个 bank 加载器补无 index.json 的单文件回退。
+- **ct 密集循环**:路由专家排除(bank 专属,同 modelopt 路径语义);shared_expert
+  gate|up 的 NVFP4 融合组(旧组只覆盖 dense `.mlp.`);配方未量化的
+  o_proj/GDN out_proj(bf16)加载时 RTN 打包进 W4A16 缓冲(沿用 FP8-MLP fold 先例)。
+- `nvfp4_quant._round_e2m1_idx` 边界张量跟随输入设备(原先 CPU 张量在 CUDA 输入上崩)。
+
+**两处 box 专属 workaround(部署时实测发现,均写入 /etc/default/ftserve)**:
+
+- `PYTORCH_ALLOC_CONF=expandable_segments:False`:引擎默认开的 expandable_segments 在
+  WSL dxg 上,首个大张量(1 GB embed_tokens)的 safetensors CUDA 直读触发
+  "CUDA driver error: unknown error"(dmesg `dxgkio_share_objects -131`);modelopt
+  路径分配序列不同不触发。独立进程复现不了(需引擎完整前奏),禁用后即好。
+- `FREETOKEN_CT_DENSE_BF16=1`(新 env 开关):ct 纯 NVFP4 的 **W4A16 注意力**
+  (q/k/v/o + RTN 的 out_proj)在本机 Ampere+WSL 上输出恒为 token 0(全 `!`)。
+  bf16 密集栈 + NVFP4 专家 banks 完全正常。nvidia 对照组(fp8 注意力)同代码正常、
+  W4A16 shared expert 亦正常——嫌疑收敛到 W4A16 注意力内核路径,待上游 root-cause。
+  数据侧已逐位排除:bank 与检查点参考反量化一致、dense 全张量有限且量级正常、
+  与 nvidia 同源张量(norm/in_proj_b/a/conv1d/mlp.gate)逐位一致。
+
+**部署**:`/etc/default/ftserve` 直写(FT_MODEL=lyf/…、KV 262144/MAX_OUT 32768/
+MAX_RUNNING 2、全套 FT_EXTRA_ARGS + 上述两个 env;`ftswitch` 会整写文件并重置额外
+env,**不要**用它切换此模型)。冷加载 ~1 分钟(页缓存热)。
+
+**验证(2026-09-16,ftserve@:8010)**:greedy 补全正常(Paris/fibonacci)、thinking
+数学正确、流式 22.7 tok/s(基线 27.2,瓶颈仍在 CPU MoE)、MoE 命中率 63%、KV
+262230 页满额、VRAM 10.7/12 GB、RAM 20/23 GB。无审查行为抽检符合预期。
+
+已知边界:lyf 的 config `vision_config.model_type=qwen3_5_moe`(引擎期望带 `_vision`
+后缀)→ 多模态误检为 text-only,本次以**纯文本**上线;MTP 依旧不适用(WSL 楔死)。
+运维注:WSL 里 nohup 启动的进程需 ~8 秒尾随等待再退出 wsl 会话,否则被会话拆除
+带走(诊断期数次"空日志暴毙"皆此);WSL 空闲关机问题依旧,Windows 侧保活必需。
+
 ## 版本说明 / Versioning
 
 - 本 fork 标签:**`qwen38-vision-v1.0.0`**(见 git tag)

@@ -48,6 +48,25 @@ _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     layer_to_bank=lambda layer, config: layer,  # every layer is MoE
     desc="Qwen3.5 NVFP4 experts",
 )
+# compressed-tensors NVFP4 MoE exports (e.g. lyf/Qwen3.6-35B-A3B-*-NVFP4, converted from
+# GGUF back to HF): per-expert tensors under the transformers-canonical
+# ``language_model.model.layers.N.mlp.experts.E.{proj}`` key with llm-compressor suffixes
+# (weight_packed / weight_scale / weight_global_scale).
+_NVFP4_CT_EXPERT_KEY_RE = re.compile(
+    r"^language_model\.model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+    r"(?P<proj>gate_proj|up_proj|down_proj)\."
+    r"(?P<kind>weight_packed|weight_scale|weight_global_scale)$"
+)
+_NVFP4_CT_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
+    key_pattern=_NVFP4_CT_EXPERT_KEY_RE,
+    proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
+    layer_to_bank=lambda layer, config: layer,  # every layer is MoE
+    desc="Qwen3.5 compressed-tensors NVFP4 experts",
+    kind_packed="weight_packed",
+    kind_block_scale="weight_scale",
+    kind_global_scale="weight_global_scale",
+    global_scale_is_divisor=True,
+)
 # Suffixes of the per-tensor modelopt quant scales; consumed alongside their ``.weight``,
 # never yielded on their own.
 _SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
@@ -164,6 +183,10 @@ def _rename(raw_name: str, include_vision: bool = False) -> str | None:
     name = raw_name
     if name.startswith("model.language_model."):
         name = "model." + name[len("model.language_model.") :]
+    elif name.startswith("language_model.model."):
+        # transformers-canonical multimodal naming (e.g. lyf/Qwen3.6-35B-A3B-*-NVFP4):
+        # the text body sits at language_model.model.* -- strip BOTH wrappers.
+        name = "model." + name[len("language_model.model.") :]
     elif name.startswith("language_model."):
         name = "model." + name[len("language_model.") :]
     return name
@@ -646,6 +669,11 @@ def _iter_weights_attn_fp8(
 _CT_NVFP4_FUSE: dict[str, tuple[str, ...]] = {
     ".self_attn.qkv_proj": (".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj"),
     ".mlp.gate_up_proj": (".mlp.gate_proj", ".mlp.up_proj"),
+    # MoE shared expert arrives as separate packed gate/up (dense-ct exports predate MoE);
+    # the model's shared expert is the same fused W4A16 linear as the modelopt path's.
+    ".mlp.shared_expert.gate_up_proj": (
+        ".mlp.shared_expert.gate_proj", ".mlp.shared_expert.up_proj",
+    ),
 }
 _CT_BF16_FUSE: dict[str, tuple[str, ...]] = {
     ".linear_attn.in_proj": (
@@ -778,6 +806,11 @@ def _iter_weights_compressed_tensors(
                 name = _rename(raw_name, include_vision)
                 if name is None:
                     continue
+                if ".mlp.experts." in name:
+                    # Routed experts always load through the NVFP4 bank machinery
+                    # (offload AND fused), exactly like the modelopt paths -- never the
+                    # dense pass. ct exports are new as MoE; dense ones had no experts.
+                    continue
                 if name.startswith(("vision_tower.", "embed_vision.")):
                     yield name, reader.get_tensor(raw_name)  # bf16 vision stack
                     continue
@@ -856,6 +889,22 @@ def _iter_weights_compressed_tensors(
                         continue
 
                 if name.endswith(".weight"):
+                    base = name[: -len(".weight")]
+                    raw_base = raw_name[: -len(".weight")]
+                    # An export whose recipe left an NVFP4-native standalone projection
+                    # (o_proj / GDN out_proj) un-quantized bf16 (e.g. lyf's GGUF->HF
+                    # conversion ignores linear_attn): pack it RTN so it lands in the
+                    # W4A16 buffers, exactly like the FP8-MLP fold below in spirit.
+                    if (
+                        nvfp4
+                        and base.endswith((".self_attn.o_proj", ".linear_attn.out_proj"))
+                        and raw_base + ".weight_packed" not in reader
+                    ):
+                        w4, s4, g4 = quantize_nvfp4_rtn(reader.get_tensor(raw_name))
+                        yield base + ".weight", w4
+                        yield base + ".weight_scale", s4
+                        yield base + ".weight_global", g4
+                        continue
                     yield from _emit_bf16_weight(name, reader.get_tensor(raw_name))
                     continue
 
@@ -1265,6 +1314,14 @@ def _setup_bf16_dequant_banks(model_path, model_config, device, dummy: bool, *, 
     return ExpertBanks("bf16", banks, streamed=layer_sink is not None)
 
 
+def _nvfp4_expert_spec(model_path: str) -> Nvfp4ExpertSourceSpec:
+    """ModelOpt naming by default; compressed-tensors exports pack experts under
+    ``language_model.model.*`` with llm-compressor suffixes."""
+    if _compressed_tensors_nvfp4(cached_load_hf_config(model_path)):
+        return _NVFP4_CT_SOURCE_SPEC
+    return _NVFP4_SOURCE_SPEC
+
+
 def load_nvfp4_expert_sources(
     model_path: str, config, *, layer_sink=None
 ) -> dict[str, torch.Tensor]:
@@ -1273,7 +1330,7 @@ def load_nvfp4_expert_sources(
     return load_nvfp4_expert_source_banks(
         model_path,
         config,
-        _NVFP4_SOURCE_SPEC,
+        _nvfp4_expert_spec(model_path),
         drop_page_cache=drop_page_cache,
         primary=get_tp_info().is_primary(),
         layer_sink=layer_sink,
@@ -1289,7 +1346,7 @@ def load_nvfp4_expert_sources_parallel(
     return load_nvfp4_expert_source_banks_parallel(
         model_path,
         config,
-        _NVFP4_SOURCE_SPEC,
+        _nvfp4_expert_spec(model_path),
         drop_page_cache=drop_page_cache,
         primary=get_tp_info().is_primary(),
         workers=workers,
