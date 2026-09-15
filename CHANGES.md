@@ -290,8 +290,10 @@ token 新请求 B:
   2.7.14.0 / 内核 6.18.33.2-2 亦为最新,且无更新的 beta——两个 GPU 路径崩溃
   (MTP 35B 异步非法访问、cpu-layers-0 的 bank 页注册硬崩)均在新栈上复现,
   **非"更新驱动"可解**;出路为原生 Linux 或后续驱动版本。另:dmesg 显示 WSLg
-  weston(rdp-backend.so)每 ~100s segfault 一次,与服务无关,纯 headless 使用
-  可在 .wslconfig 加 `guiApplications=false` 止损(顺带省内存)。
+  weston(rdp-backend.so)每 ~100s segfault 一次,与服务无关——已用
+  `.wslconfig`(`guiApplications=false` + `memory=24GB` 显式固定)关闭 WSLg,
+  weston 消失、27.2 tok/s 不变;注意 WSL 自动内存配额在重启后会漂移(曾观测
+  23GB→15GB),显式 `memory=` 固定是必要的。
 
 ## 版本说明 / Versioning
 
