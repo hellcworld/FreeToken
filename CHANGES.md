@@ -286,6 +286,12 @@ token 新请求 B:
   sleep 30; done'`。
 - 部署工具链:diagnostics/rexec.py(paramiko,FT116_PW 环境变量)+ box_*.sh/py
   A/B 脚本(改 /etc/default/ftserve → 重启 → 1-token 探针等就绪 → 测速)。
+- **更新排查(2026-09-15)**:驱动 616.92(2026-09-11 安装)= 最新 WHQL,WSL
+  2.7.14.0 / 内核 6.18.33.2-2 亦为最新,且无更新的 beta——两个 GPU 路径崩溃
+  (MTP 35B 异步非法访问、cpu-layers-0 的 bank 页注册硬崩)均在新栈上复现,
+  **非"更新驱动"可解**;出路为原生 Linux 或后续驱动版本。另:dmesg 显示 WSLg
+  weston(rdp-backend.so)每 ~100s segfault 一次,与服务无关,纯 headless 使用
+  可在 .wslconfig 加 `guiApplications=false` 止损(顺带省内存)。
 
 ## 版本说明 / Versioning
 
