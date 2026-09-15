@@ -280,6 +280,16 @@ token 新请求 B:
   banks 16.93GB 的强制拆分);缓存再平衡、GDN 状态 bf16 对单流 decode 均无感。
 - **MTP 在此机不可用**:116 即第四节记录的 WSL 验证机,35B spec 的异步非法 access
   未根治前不要在此开启;spec 图捕获/overlap 恢复见 docs/spec-graph-design.md。
+- **MTP 复测(2026-09-15,WSLg 关闭后)**:环境变更(关 WSLg + memory=24GB +
+  驱动 616.92)后受控重试两次,均在首个 greedy spec 请求处**确定性楔死**
+  (日志静默、curl 115s 超时、进程最终死亡由 systemd 拉回;与第四节的
+  "cudaEventRecord 空转"signature 一致)——WSLg/dxg 噪声假设被证伪,更像
+  spec 路径与 35B/WSL CUDA 运行时的真 bug,判别环境只剩原生 Linux。
+  附带两个操作性发现:(1) `is_greedy` 要求 `top_p == 1.0`——只发
+  `temperature=0` 而 `sampling_defaults=model` 补了 `top_p=0.95` 时 spec
+  整批降级为普通解码(真实 agent 客户端极易踩中,值得后续放宽判定或文档
+  提示);(2) 盒子 ft_serve.sh 的 `FREETOKEN_LOAD_VISION` 已改为可用环境
+  变量覆盖(`${FREETOKEN_LOAD_VISION:-1}`),MTP 门禁要求 multimodal 关闭。
 - **运维根因**:WSL 在最后一个会话退出后随之关闭,ftserve 约 10 分钟的冷加载被
   反复 SIGTERM(9-14 晚 21 点的"崩溃循环"与"服务经常是死的"皆此因)。需 Windows
   侧常驻会话保活;临时手段:后台挂 `wsl -d Ubuntu -- bash -c 'while true; do
