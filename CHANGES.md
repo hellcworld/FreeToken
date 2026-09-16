@@ -347,8 +347,16 @@ env,**不要**用它切换此模型)。冷加载 ~1 分钟(页缓存热)。
 数学正确、流式 22.7 tok/s(基线 27.2,瓶颈仍在 CPU MoE)、MoE 命中率 63%、KV
 262230 页满额、VRAM 10.7/12 GB、RAM 20/23 GB。无审查行为抽检符合预期。
 
-已知边界:lyf 的 config `vision_config.model_type=qwen3_5_moe`(引擎期望带 `_vision`
-后缀)→ 多模态误检为 text-only,本次以**纯文本**上线;MTP 依旧不适用(WSL 楔死)。
+**多模态已上线(2026-09-16 二次部署)**:`FREETOKEN_LOAD_VISION=1` 后视觉塔正常
+加载并在线服务——`image_url`(data: URL)传特征图,模型准确识别红方块/蓝圆/绿三
+角/黑线;文本路径零回归("Paris"依旧)。KV 262270 页(视觉塔 ~0.9 GiB bf16 计入
+权重后预算几乎不变)、VRAM 10.7/12 GB。**勘误**:本节初版曾把纯文本上线归因于
+"lyf 的 vision_config.model_type 命名差异导致误检"——实际 `_parse_vision_config`
+只看 vision_config 字段是否存在 + `FREETOKEN_LOAD_VISION` 开关(默认 0),不看
+model_type;lyf 的 vision_config 字段与 nvidia 逐项一致(model_type 字符串差异无
+影响),初判 text-only 纯因部署时显式设了 `FREETOKEN_LOAD_VISION=0`。
+
+已知边界:MTP 依旧不适用(WSL 楔死)。
 运维注:WSL 里 nohup 启动的进程需 ~8 秒尾随等待再退出 wsl 会话,否则被会话拆除
 带走(诊断期数次"空日志暴毙"皆此);WSL 空闲关机问题依旧,Windows 侧保活必需。
 
