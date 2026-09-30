@@ -419,6 +419,17 @@ nvidia modelopt 均不需要(config.py:299 门控在 ct 检测内,互不影响)�
 首次意外重启(WSL 服务打嗝)实测:systemd 自动拉回、补丁加载器二次冷载成功、
 探针正常——重启路径验证通过。
 
+**DSH 接入(2026-09-30 追加)**:DeepSeek Harness(`@deepseek-ai/dsh` 0.2.0-rc.2,
+npm 全局 + Node 22)以 custom provider 接入 ftserve——provider 必须声明在
+**`llm-pi-ai`** 适配器条目(写 `llm` 会 NO_ADAPTER),协议 `openai-completions`,
+baseURL `http://127.0.0.1:8010/v1`,pi-ai 适配器强制要 key(哑值 `FTSERVE_API_KEY`);
+`dsh.service` systemd 单元(adminuser/Restart=always),LAN 经 netsh portproxy
+0.0.0.0:3080→127.0.0.1:3080 + `--trusted-host`(dsh 拒绝绑 0.0.0.0,自带 token
+围栏,journalctl -u dsh 取当次 token)。**缓存命中 0% 根因**:FT_EXTRA_ARGS 缺
+`--enable-cache-report`(openai_api._reported_cached 门控),实际 radix 前缀缓存
+一直在命中(同前缀双请求 TTFT 7.9s→2.6s);加 flag 后 usage 吐
+`prompt_tokens_details.cached_tokens`(实测 2715 中 2688 命中)。
+
 ## 版本说明 / Versioning
 
 - 本 fork 标签:**`qwen38-vision-v1.0.0`**(见 git tag)
