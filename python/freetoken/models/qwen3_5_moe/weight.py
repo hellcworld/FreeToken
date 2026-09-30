@@ -49,11 +49,14 @@ _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     desc="Qwen3.5 NVFP4 experts",
 )
 # compressed-tensors NVFP4 MoE exports (e.g. lyf/Qwen3.6-35B-A3B-*-NVFP4, converted from
-# GGUF back to HF): per-expert tensors under the transformers-canonical
-# ``language_model.model.layers.N.mlp.experts.E.{proj}`` key with llm-compressor suffixes
-# (weight_packed / weight_scale / weight_global_scale).
+# GGUF back to HF): per-expert tensors under a transformers-canonical wrapper with
+# llm-compressor suffixes (weight_packed / weight_scale / weight_global_scale). Both
+# canonical wrappers exist in the wild: lyf ships ``language_model.model.layers.*`` while
+# unsloth/Qwen3.6-35B-A3B-NVFP4-Fast ships ``model.language_model.layers.*`` (the same
+# prefix as the modelopt export above).
 _NVFP4_CT_EXPERT_KEY_RE = re.compile(
-    r"^language_model\.model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+    r"^(?:language_model\.model|model\.language_model)\.layers\.(?P<layer>\d+)\."
+    r"mlp\.experts\.(?P<expert>\d+)\."
     r"(?P<proj>gate_proj|up_proj|down_proj)\."
     r"(?P<kind>weight_packed|weight_scale|weight_global_scale)$"
 )

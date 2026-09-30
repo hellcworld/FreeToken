@@ -380,6 +380,45 @@ model_type;lyf 的 vision_config 字段与 nvidia 逐项一致(model_type 字符
 - **必打补丁**:`comfy/model_detection.py` 的 out_dim 转置修复(patch_detect.py),
   **每次升级 ComfyUI 后重打**;详见 comfy-box/README"已知问题"。
 
+## 八、unsloth/Qwen3.6-35B-A3B-NVFP4-Fast 上线 + ct 前缀修复(2026-09-30)
+
+**修复(loader)**:ct NVFP4 专家 bank 的键位正则此前只认 lyf 的
+`language_model.model.layers.*` 包装,unsloth 导出用另一规范包装
+`model.language_model.layers.*`(与 modelopt 路径同款),导致 bank 装载 0/61440、
+启动 assert 失败。`_NVFP4_CT_EXPERT_KEY_RE` 改为双前缀可选(weight.py),
+`tests/models/test_qwen3_5_quant_loading.py` 补正反例测试;mtp.* / 裸 `model.layers.*` /
+modelopt 后缀仍被排除。box 侧 site-packages 已热补丁同款文件。
+
+**模型判型(干跑校验器 `diagnostics/ft_dryrun_unsloth.py`,纯 header 不加载)**:
+compressed-tensors `mixed-precision` 导出——FP8 channel-wise 注意力
+(self_attn q/k/v/o、GDN in_proj_qkv/z、out_proj、lm_head,W8A16 路径)+ NVFP4
+路由专家与 shared_expert(packed) + bf16(vision 塔 333 张量、router、GDN b/a、
+mtp.* 19 张量丢弃)。全部键位可路由,40 层 × 256 专家 × {gate,up,down} packed
+分毫不差;`FREETOKEN_CT_DENSE_BF16=1` 对混合导出必须移除(会关掉 fp8 注意力
+路径、裸吐 FP8 张量)——已从 /etc/default/ftserve 删除,备份 ftserve.bak-unsloth。
+
+**部署/实测(ftserve@:8010,RTX 3060 12GB)**:下载 23G(hf-mirror);加载成功,
+MoE 后端 auto→offload(按需加载不变),VRAM 11.27/12 GB、RAM 20/23 GB。正确性
+四探针全过:Paris ✓、fibonacci 13 ✓、17×23=391 ✓、**视觉塔 ✓**(红方块→"red",
+mixed-ct 视觉路径首次实测)。基准(200 输出 token、唯一 nonce 防前缀缓存,
+对比 nvidia 版同日基线):4K TTFT 7.09s/prefill 575.9 tps(**+15%**)/decode
+23.7;8K TTFT 66.0s/122.7 tps(+5%)/23.3;decode 全档 ≈ 基线 95%(23.3-24.3
+vs 24.4-25.9),prefill 略优。**判定:保留为新默认**(FT_MODEL 已切换)。
+
+注:短 max_tokens 探针会被 thinking 阶段吃满导致 content 空——测思考模型需
+≥512 token 且同时读 reasoning_content;accept 后服务端先发一个空 delta,TTFT
+客户端须过滤空增量(否则假 0ms)。
+
+**运维警示(同六节 lyf 先例,对本默认同样成立)**:`ftswitch` 整写
+/etc/default/ftserve 并**丢弃全部额外 env**(`PYTORCH_ALLOC_CONF=expandable_segments:
+False`——ct 加载路径的 dxg workaround、`FREETOKEN_LOAD_VISION=1`)与 KV/MAX_OUT
+调优;切任何模型都**不要用 ftswitch**,用 `cp /etc/default/ftserve.bak-unsloth
+/etc/default/ftserve` + sed FT_MODEL 或 box_switch_unsloth.sh 的写法。
+`FREETOKEN_CT_DENSE_BF16=1` 仅纯 ct 检查点需要(lyf),unsloth-Fast 混合导出与
+nvidia modelopt 均不需要(config.py:299 门控在 ct 检测内,互不影响)。改后
+首次意外重启(WSL 服务打嗝)实测:systemd 自动拉回、补丁加载器二次冷载成功、
+探针正常——重启路径验证通过。
+
 ## 版本说明 / Versioning
 
 - 本 fork 标签:**`qwen38-vision-v1.0.0`**(见 git tag)

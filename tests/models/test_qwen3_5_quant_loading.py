@@ -178,6 +178,33 @@ def test_ct_mxfp4_geometry_still_rejected():
         }))
 
 
+# ------------------------------------------------------- ct expert-bank keys
+def test_ct_expert_key_pattern_accepts_both_canonical_prefixes():
+    from freetoken.models.qwen3_5_moe.weight import _NVFP4_CT_EXPERT_KEY_RE
+
+    for prefix in ("language_model.model", "model.language_model"):
+        m = _NVFP4_CT_EXPERT_KEY_RE.match(
+            f"{prefix}.layers.3.mlp.experts.17.up_proj.weight_packed"
+        )
+        assert m is not None, prefix
+        assert m.group("layer") == "3" and m.group("expert") == "17"
+        assert m.group("proj") == "up_proj" and m.group("kind") == "weight_packed"
+    assert _NVFP4_CT_EXPERT_KEY_RE.match(
+        "model.language_model.layers.3.mlp.experts.17.down_proj.weight_global_scale"
+    ).group("kind") == "weight_global_scale"
+    # mtp head experts and the un-wrapped text prefix must never match
+    assert _NVFP4_CT_EXPERT_KEY_RE.match(
+        "mtp.layers.0.mlp.experts.1.gate_proj.weight_packed"
+    ) is None
+    assert _NVFP4_CT_EXPERT_KEY_RE.match(
+        "model.layers.0.mlp.experts.1.gate_proj.weight_packed"
+    ) is None
+    # modelopt suffixes belong to the other spec, not the ct one
+    assert _NVFP4_CT_EXPERT_KEY_RE.match(
+        "model.language_model.layers.0.mlp.experts.1.gate_proj.weight_scale_2"
+    ) is None
+
+
 # ------------------------------------------------------------------ fusion guard
 def test_try_fuse_rejects_inconsistent_parts():
     from freetoken.models.qwen3_5_moe.weight import _try_fuse
