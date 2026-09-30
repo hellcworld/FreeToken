@@ -360,6 +360,26 @@ model_type;lyf 的 vision_config 字段与 nvidia 逐项一致(model_type 字符
 运维注:WSL 里 nohup 启动的进程需 ~8 秒尾随等待再退出 wsl 会话,否则被会话拆除
 带走(诊断期数次"空日志暴毙"皆此);WSL 空闲关机问题依旧,Windows 侧保活必需。
 
+## 七、comfy-box 子项目:ComfyUI 无审查图像/视频服务上线(2026-09-23)
+
+独立于 LLM 引擎的姊妹服务,**已拆分为独立仓库 `D:\comfy-box`**(git init 于
+2026-09-23,commit 470a4c8;完整文档、部署脚本、工作流模板与安全审计记录在该仓库)。要点:
+
+- **栈**:ComfyUI 0.37(tarball 直传)+ leejet ComfyUI-GGUF fork + pottokao Qwen3VL-TE
+  补丁节点;venv 直接克隆 `~/.freetoken/venv`(torch 2.11.0+cu130 复用,规避 py3.14
+  venv 损坏与镜像源龟速);三个 systemd 单元(comfyui / caddy-comfy / cloudflared-comfy),
+  与 ftserve GPU 互斥、一键切换。
+- **模型**:Qwen-Image-2.1 无审查三件套(abenzerps UC DiT Q8 + pottokao Heretic 编码器
+  Q4/mmproj + 官方 VAE)+ Wan2.2-Fun-5B-InP 视频三件套(QuantStack Q8 + umt5 fp8 +
+  **Wan2.2 VAE 48ch——用 wan_2.1_vae(16ch) 会报 tensor 16 vs 48**)。
+- **实测**:图像 1024²/25 步 75 s/张(VRAM 峰值 9.75 GB,图内文字渲染无损);视频
+  832×480/49 帧/30 步 181 s/片。工作流模板两套已入 UI 侧栏。
+- **公网**:cloudflared 快速隧道(http2)+ caddy basic-auth(401/200 实测);URL 随机轮换,
+  `~/tunnel-url.sh` 取值。首日 16:37–19:47 无鉴权暴露约 3 小时,当日完成四线审计
+  (生成任务 24/24 对账、零探测痕迹、文件系统、系统级指标),**判定无恶意访问**。
+- **必打补丁**:`comfy/model_detection.py` 的 out_dim 转置修复(patch_detect.py),
+  **每次升级 ComfyUI 后重打**;详见 comfy-box/README"已知问题"。
+
 ## 版本说明 / Versioning
 
 - 本 fork 标签:**`qwen38-vision-v1.0.0`**(见 git tag)
