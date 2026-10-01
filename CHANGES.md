@@ -439,6 +439,12 @@ provider 经 `hermes config set`:model.provider=custom + base_url
 portproxy 0.0.0.0:8187→WSL IP + 防火墙规则 caddy-hermes。双认证实测:无凭据
 401 → basic auth 过 → Hermes 登录(错 401/对 200)。Caddyfile 备份
 Caddyfile.bak-hermes;9119 直连入口保留(HTTP 可用,WS Origin 校验以 8187 为准)。
+**公网(2026-10-01 追加)**:复用 Windows 侧 token 托管 cloudflared 服务
+(`tunnel run --token-file`,隧道 b9a90e54…),经 CF API 在其 ingress 插入
+`hermes.infrafixed.com → http://192.168.100.116:8187`(comfyui 同款写法,原规则
+保留,热生效零重启)+ DNS CNAME(proxied);公网实测双认证:无凭据 401 →
+basic auth(hermes/hermes-box-9119)→ Hermes 登录(admin/hermes-box-9119)200。
+CF API token 仅内联使用未落盘,用后应吊销。
 **缓存命中 0% 根因**(DSH 时期发现,Hermes 同样受益):FT_EXTRA_ARGS 缺
 `--enable-cache-report`(openai_api._reported_cached 门控),实际 radix 前缀缓存
 一直在命中(同前缀双请求 TTFT 7.9s→2.6s);加 flag 后 usage 吐
