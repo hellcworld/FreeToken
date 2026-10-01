@@ -419,13 +419,20 @@ nvidia modelopt 均不需要(config.py:299 门控在 ct 检测内,互不影响)�
 首次意外重启(WSL 服务打嗝)实测:systemd 自动拉回、补丁加载器二次冷载成功、
 探针正常——重启路径验证通过。
 
-**DSH 接入(2026-09-30 追加)**:DeepSeek Harness(`@deepseek-ai/dsh` 0.2.0-rc.2,
-npm 全局 + Node 22)以 custom provider 接入 ftserve——provider 必须声明在
-**`llm-pi-ai`** 适配器条目(写 `llm` 会 NO_ADAPTER),协议 `openai-completions`,
-baseURL `http://127.0.0.1:8010/v1`,pi-ai 适配器强制要 key(哑值 `FTSERVE_API_KEY`);
-`dsh.service` systemd 单元(adminuser/Restart=always),LAN 经 netsh portproxy
-0.0.0.0:3080→127.0.0.1:3080 + `--trusted-host`(dsh 拒绝绑 0.0.0.0,自带 token
-围栏,journalctl -u dsh 取当次 token)。**缓存命中 0% 根因**:FT_EXTRA_ARGS 缺
+**DSH→Hermes(2026-10-01 更替)**:DSH 全套移除(systemd 单元/npm 包 542 个/
+~/.dsh 配置,config 备份 /root/dsh-backup-*.tgz;nodejs 留用),替换为 Nous Research
+**hermes-agent**(codeload tarball → 本地 git 裸仓 → `HERMES_REPO_URL` 重跑官方
+install.sh 绕开 github.com git 直连不通;uv/Python 3.14 走 hermes-assets 镜像正常)。
+provider 经 `hermes config set`:model.provider=custom + base_url
+`http://127.0.0.1:8010/v1` + 哑 key,一次性任务 `hermes -z` 端到端验证通过
+(HERMES-FTSERVE-OK,ftserve 落账)。**Web dashboard**:`hermes-dashboard.service`
+(adminuser/Restart=always/--host 0.0.0.0:9119),认证走 `dashboard.basic_auth`
+(admin + scrypt 哈希;**生成哈希必须 import hermes_bootstrap**,裸 tools python 缺
+依赖),`dashboard.public_url=http://192.168.100.116:9119` 声明后 Host 校验放行且
+强制认证门(错凭据 401/对凭据 200 实测);LAN 经 portproxy **直指 WSL IP**
+(0.0.0.0:9119→172.22.205.38:9119,ComfyUI 同款——WSL localhost 中继在这台机器
+上反复断,portproxy→127.0.0.1 链路不可靠,已弃用)。凭据:admin / hermes-box-9119。
+**缓存命中 0% 根因**(DSH 时期发现,Hermes 同样受益):FT_EXTRA_ARGS 缺
 `--enable-cache-report`(openai_api._reported_cached 门控),实际 radix 前缀缓存
 一直在命中(同前缀双请求 TTFT 7.9s→2.6s);加 flag 后 usage 吐
 `prompt_tokens_details.cached_tokens`(实测 2715 中 2688 命中)。
