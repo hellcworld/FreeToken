@@ -445,6 +445,36 @@ Caddyfile.bak-hermes;9119 直连入口保留(HTTP 可用,WS Origin 校验以 818
 保留,热生效零重启)+ DNS CNAME(proxied);公网实测双认证:无凭据 401 →
 basic auth(hermes/hermes-box-9119)→ Hermes 登录(admin/hermes-box-9119)200。
 CF API token 仅内联使用未落盘,用后应吊销。
+
+## 九、GPU 管家:ftserve/ComfyUI 显存分时复用(2026-10-02)
+
+12GB 卡上两服务原本同时驻留(98% 满,生图即 OOM 风险)。新增**单进程 asyncio 网关**
+`scripts/gpu_gateway.py`(纯 stdlib,~350 行)+ `gpu-gateway.service`(root/Restart=
+always/开机自启):网关接管对外端口 **:8010(LLM)/:8188(ComfyUI)**,后端各上移一端口
+(ftserve→8011、ComfyUI→8191),对外消费方(Hermes/caddy/portproxy/ft_proxy:8000)
+零改动;ftserve 开机**懒加载**(`systemctl disable ftserve`,网关按需拉起)。
+
+- **LLM 侧**:`/v1/stats|/health|/gpu-gateway/status` 网关本地应答(**监控不唤醒**);
+  其余请求 single-flight 唤醒 ftserve 并扣住直到就绪(就绪信号=ftserve `/health`
+  status=="ok"——/v1/stats 加载中就返回 200 且 kv 字段冷启动后为 null,均不可作准),
+  然后**原始字节透传**(SSE/WS 天然支持)。唤醒失败→503。
+- **ComfyUI 侧**:`POST /prompt` 先等 ftserve 排空(gateway 在途 0 + 上游 active 0,
+  上限 COMFY_WAIT_CAP)再 `systemctl stop` 放行;其余流量透明透传。
+- **管家循环**:LLM 空闲 FT_IDLE(=600s)→ 停 ftserve 释放 ~11GB;ComfyUI 队列空
+  COMFY_FREE_IDLE(=300s)→ `POST /free unload_all` 释放残留。参数经 unit env 注入。
+
+**实测(T1-T5)**:监控不唤醒 ✓;冷唤醒 58s(connecting→loading→warmup→ok)后
+"Paris." 完整透传 ✓;90s 空闲自动卸载、显存 12GB→**153 MiB** ✓;生图请求先卸载
+ftserve 再放行、ComfyUI 应答透传、空闲 /free ✓;LLM 流式进行中生图 5s 等不到 GPU
+→503 且流式无恙 ✓;hermes -z 经网关端到端 ✓(真实冷唤醒含在内)。
+
+**踩坑记录**:(1) 隧道首版把 client writer 当读端传给泵,连接即塌;(2) WSL 会话
+要等**会话内全部进程**退出才关,脚本后台块必须 setsid,否则 wsl.exe 挂到 curl
+超时;(3) 网关重启的同一秒打进来的请求会哑失败——脚本要 settle 几秒。运维:
+改 FT_IDLE 等参数编辑 unit 的 Environment= 后 `systemctl daemon-reload && systemctl
+restart gpu-gateway`;回滚:恢复 `/etc/default/ftserve.bak-gov`、
+`comfyui.service.bak-gov`,`systemctl disable --now gpu-gateway && systemctl enable
+--now ftserve comfyui`。
 **缓存命中 0% 根因**(DSH 时期发现,Hermes 同样受益):FT_EXTRA_ARGS 缺
 `--enable-cache-report`(openai_api._reported_cached 门控),实际 radix 前缀缓存
 一直在命中(同前缀双请求 TTFT 7.9s→2.6s);加 flag 后 usage 吐
