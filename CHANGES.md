@@ -480,6 +480,37 @@ restart gpu-gateway`;回滚:恢复 `/etc/default/ftserve.bak-gov`、
 一直在命中(同前缀双请求 TTFT 7.9s→2.6s);加 flag 后 usage 吐
 `prompt_tokens_details.cached_tokens`(实测 2715 中 2688 命中)。
 
+## 十、Bonsai 2 27B 三值模型试验部署:PrismML llama.cpp 并行后端(2026-10-08)
+
+评估 PrismML **Ternary-Bonsai-2-27B**(Qwen3.8-27B 基底,~1.7bpw 三值 PQ2_0,
+7.04GiB)后按 64K 上下文档试部署。freetoken **无法加载**该格式(PQ2_0/PTQ1_0 为
+PrismML 私有 ggml 类型,本仓库 GGUF 路径仅 Q4_0/Q8_0/Q6_K+F16/BF16/F32,且
+`GGUF_ARCH_TO_REGISTRY` 仅注册 gemma4)→ 以 **PrismML llama.cpp fork** 的
+llama-server 作为并行 LLM 后端,与 ftserve 互为备选。
+
+- **运行时**:fork 源码 `prism-b10743-adfffbe`(codeload tarball;decent-jawfish 的
+  MTP Hadamard 逆变换补丁在该 tag **已上游合并**于 qwen35.cpp,无需再打);
+  模型用 decent-jawfish 嫁接 MTP 头的单文件 GGUF + prism-ml mmproj-Q8_0(视觉)。
+- **编译血泪**:盒子 Ubuntu 26.04 新 glibc 与 CUDA 12.x 头文件冲突
+  (mathcalls.h `noexcept` 声明不兼容,连编译器探测都过不了),12.8/12.9/13.0 全灭;
+  预编译二进制被 gh 镜像限流阻断(codeload/release-assets 本网络 ~20-40KB/s)。
+  最终 **CUDA 13.3 + gcc/g++-14(host)** 编译通过(`build133/`),实测本机无崩溃
+  (KNOWN_ISSUES 的 13.3 崩溃报告未复现;若日后异常优先怀疑此点)。
+- **部署形态**:`bonsai.service`(8012,手动启、**不开机自启**):`-ngl 999 -fa on
+  -c 65536 -ctk/-ctv q8_0 --jinja --spec-type draft-mtp --spec-draft-n-max 2
+  --image-min-tokens 1024 -np 1 --cache-ram 8192`+ 模型卡思考档采样默认(temp 1.0/
+  top-p 0.95/top-k 20/min-p 0)。启动前必须 `systemctl stop ftserve`(两者各占
+  ~11GB 显存,同跑必 OOM);gpu-gateway **不感知** bonsai,不代管其启停。
+- **实测(RTX 3060 12GB,64K ctx)**:加载 20s,显存 11.5/12.3GB;decode
+  **34.1 tok/s(思考)/43.5 tok/s(不思考)**,MTP 接受率 0.38-0.64(temp 1.0 下;
+  temp 0 基准可达 0.92);prefill **4K=509、16K=501 tok/s(长上下文平坦)**;对比
+  ftserve NVFP4-Fast:decode 25.6、8K prefill 116、64K 实测不可用。视觉可用
+  (准确读出图中霓虹文字),工具调用规范(finish_reason=tool_calls、参数 JSON 正确)。
+- **文件**:模型 `/home/adminuser/models/bonsai2`(7.7GB)、源码+二进制
+  `/home/adminuser/llama.cpp-prism`(build133)、日志 `~/logs/bonsai_*.log`、
+  部署/测试脚本 `diagnostics/box_bonsai_*.sh`;gpustat 已加 bonsai-llama 行。
+  启动:`systemctl stop ftserve && systemctl start bonsai`;恢复原状:反向即可。
+
 ## 版本说明 / Versioning
 
 - 本 fork 标签:**`qwen38-vision-v1.0.0`**(见 git tag)
