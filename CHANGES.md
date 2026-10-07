@@ -511,6 +511,26 @@ llama-server 作为并行 LLM 后端,与 ftserve 互为备选。
   部署/测试脚本 `diagnostics/box_bonsai_*.sh`;gpustat 已加 bonsai-llama 行。
   启动:`systemctl stop ftserve && systemctl start bonsai`;恢复原状:反向即可。
 
+## 十一、bonsai 接管分时管理:网关改为后端无关(LLM=llama-server)(2026-10-08)
+
+`gpu-gateway` 的受管 LLM 后端由 ftserve 换为 **bonsai**(llama-server :8012),承担
+全部唤醒/空闲卸载/生图门禁;ftserve 退居手动备用(已停用、不开机自启)。
+
+- **网关改造**(`scripts/gpu_gateway.py`):新增 `FT_UNIT` 环境变量(唤醒/停车/日志
+  全走该单元);统计源后端无关化——ftserve 原生 `/v1/stats`,llama-server 走
+  `/slots`(active=is_processing 计数)+ `/props`(每次唤醒取一次模型名),归一化成
+  同一 `{"requests":{"active":N}}` 形状供管家/排空门禁消费;`/health` 两者同为
+  `{"status":"ok"}`,就绪判定零改动。unit env:`FT_UNIT=bonsai FT_UP_PORT=8012`
+  (其余 FT_IDLE=600 等不变)。
+- **实测(新网关 T1-T5+hermes)**:监控不唤醒 ✓;冷唤醒 **12s**(ftserve 时代 58s)
+  且**llama-server 不校验 model 字段**——hermes 配置零改动直连 ✓;LLM 流式进行中
+  生图 cap=8s → 503、流式无恙 ✓;生图门禁 "parking bonsai" 后透传(ComfyUI 正常
+  校验 400)✓;FT_IDLE=90 → ~120s 停车、显存 **148MiB** ✓;`hermes -z` 经
+  :8010 端到端 ✓。gpustat 已适配(llm health 指 :8012,stats 解析兼容两种形状)。
+- **运维注意**:ftserve 不再被网关管理——手动启用前先 `systemctl stop bonsai`
+  (两者各占 ~11GB 显存,同跑必 OOM);换回 ftserve 只需把 unit env 改回
+  `FT_UNIT=ftserve FT_UP_PORT=8011` 后 `daemon-reload && restart gpu-gateway`。
+
 ## 版本说明 / Versioning
 
 - 本 fork 标签:**`qwen38-vision-v1.0.0`**(见 git tag)

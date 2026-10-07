@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
-"""gpu-gateway: VRAM time-sharing front proxy for ftserve + ComfyUI on one GPU.
+"""gpu-gateway: VRAM time-sharing front proxy for the LLM backend + ComfyUI on one GPU.
 
 Owns the two well-known ports and moves the real backends one port up:
 
-    LLM clients (:8010)  -> gateway -> ftserve (:8011)
+    LLM clients (:8010)  -> gateway -> LLM backend (FT_UNIT: ftserve :8011 / llama-server :8012)
     ComfyUI   (:8188)    -> gateway -> ComfyUI (:8191)
 
 Rules (all timings via env, seconds):
-  * An inference request wakes ftserve (systemctl start + readiness poll) and is
+  * An inference request wakes the backend (systemctl start + readiness poll) and is
     held until ready; /v1/stats & /health are answered locally and never wake.
-  * ftserve idles (no in-flight requests, no activity) for FT_IDLE -> stopped.
-  * A ComfyUI /prompt submission waits for ftserve to drain (COMFY_WAIT_CAP),
+  * The backend idles (no in-flight requests, no activity) for FT_IDLE -> stopped.
+  * A ComfyUI /prompt submission waits for the backend to drain (COMFY_WAIT_CAP),
     then stops it before the job is let through.
   * ComfyUI queue empty for COMFY_FREE_IDLE -> POST /free {"unload_all": true}.
+
+Stats are backend-agnostic: ftserve serves /v1/stats natively; llama-server is
+probed via /slots (+ /props once for the model name) and normalized into the
+same {"requests": {"active": N}} shape the governor and drain gate read.
+/health is the lifecycle signal for both ({"status": "ok"} when serving).
 
 Proxying is raw-TCP: only the first request head is parsed for routing, then
 bytes are pumped in both directions, so SSE and WebSockets pass through as-is.
@@ -29,6 +34,7 @@ import urllib.request
 
 FT_PORT = int(os.environ.get("FT_PORT", 8010))
 FT_UP = ("127.0.0.1", int(os.environ.get("FT_UP_PORT", 8011)))
+FT_UNIT = os.environ.get("FT_UNIT", "ftserve")  # systemd unit the gateway wakes/parks
 COMFY_PORT = int(os.environ.get("COMFY_PORT", 8188))
 COMFY_UP = ("127.0.0.1", int(os.environ.get("COMFY_UP_PORT", 8191)))
 FT_IDLE = float(os.environ.get("FT_IDLE", 600))
@@ -47,6 +53,7 @@ _state: dict = {
     "ft_inflight": 0,
     "wake_task": None,
     "last_stats": None,
+    "llm_model": None,  # llama-server /props model name, cached once per wake
     "comfy_last_active": time.time(),
     "comfy_freed": False,
     "started": time.time(),
@@ -71,20 +78,50 @@ def _http_json(url: str, method: str = "GET", body: bytes | None = None, timeout
 
 
 def _ft_ready(health: dict | None) -> bool:
-    """/health is the authoritative lifecycle signal: loading -> ok -> error."""
+    """/health is the authoritative lifecycle signal (both backends): loading -> ok -> error."""
     return bool(health) and health.get("status") == "ok"
 
 
+def _stats_active(stats) -> int:
+    """In-flight request count from either backend's normalized stats shape."""
+    if not isinstance(stats, dict):
+        return 0
+    try:
+        return int((stats.get("requests") or {}).get("active") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 async def _ft_probe(ready_only: bool = False) -> dict | None:
-    """Poll /health (lifecycle). Also refresh the cached /v1/stats when reachable."""
-    health = await asyncio.to_thread(
-        _http_json, f"http://127.0.0.1:{FT_UP[1]}/health"
-    )
-    stats = await asyncio.to_thread(
-        _http_json, f"http://127.0.0.1:{FT_UP[1]}/v1/stats"
-    )
+    """Poll /health (lifecycle). Also refresh the cached stats when reachable.
+
+    ftserve: /v1/stats natively. llama-server: /slots normalized (active = slots
+    with is_processing); /props is fetched once per wake for the model name."""
+    base = f"http://127.0.0.1:{FT_UP[1]}"
+    health = await asyncio.to_thread(_http_json, f"{base}/health")
+    stats = await asyncio.to_thread(_http_json, f"{base}/v1/stats")
+    if stats is None:
+        slots = await asyncio.to_thread(_http_json, f"{base}/slots")
+        if isinstance(slots, list):
+            stats = {
+                "backend": "llama-server",
+                "model": _state.get("llm_model"),
+                "requests": {
+                    "active": sum(1 for s in slots if isinstance(s, dict) and s.get("is_processing")),
+                    "slots": len(slots),
+                },
+            }
+            if _state.get("llm_model") is None:
+                props = await asyncio.to_thread(_http_json, f"{base}/props")
+                path = ((props or {}).get("model_path")
+                        or (props or {}).get("default_model") or "")
+                if path:
+                    _state["llm_model"] = path.rsplit("/", 1)[-1]
+                    stats["model"] = _state["llm_model"]
     if stats is not None:
         _state["last_stats"] = stats
+        if _state.get("llm_model") and isinstance(stats, dict) and not stats.get("model"):
+            stats["model"] = _state["llm_model"]
     if health is None:
         return None
     if ready_only and not _ft_ready(health):
@@ -107,12 +144,13 @@ async def _systemctl(*args: str) -> bool:
 
 
 async def _wake_ft() -> bool:
-    """single-flight: start ftserve and wait until /v1/stats answers."""
+    """single-flight: start the LLM unit and wait until /health says ok."""
     _state["ft"] = "waking"
-    log("waking ftserve (systemctl start)")
-    if not await _systemctl("start", "ftserve"):
+    _state["llm_model"] = None
+    log(f"waking {FT_UNIT} (systemctl start)")
+    if not await _systemctl("start", FT_UNIT):
         _state["ft"] = "down"
-        log("systemctl start ftserve failed")
+        log(f"systemctl start {FT_UNIT} failed")
         return False
     deadline = time.monotonic() + FT_WAKE_CAP
     last_note = 0.0
@@ -120,19 +158,19 @@ async def _wake_ft() -> bool:
         if await _ft_probe(ready_only=True) is not None:
             _state["ft"] = "up"
             _state["ft_last_active"] = time.time()
-            log("ftserve is up")
+            log(f"{FT_UNIT} is up")
             return True
         if time.monotonic() - last_note > 15:
             log(f"waking... {_state.get('load_note', 'connecting')}")
             last_note = time.monotonic()
         await asyncio.sleep(2)
     _state["ft"] = "down"
-    log(f"ftserve did not become ready within {FT_WAKE_CAP}s")
+    log(f"{FT_UNIT} did not become ready within {FT_WAKE_CAP}s")
     return False
 
 
 async def ensure_ft() -> bool:
-    """Make sure ftserve is serving; concurrent callers share one wake."""
+    """Make sure the LLM backend is serving; concurrent callers share one wake."""
     if _state["ft"] == "up" and await _ft_probe(ready_only=True) is not None:
         return True
     if _state["wake_task"] is None:
@@ -145,23 +183,22 @@ async def ensure_ft() -> bool:
 
 
 async def ensure_gpu_for_comfy() -> bool:
-    """Stop ftserve (after draining) so ComfyUI can take the GPU."""
+    """Stop the LLM backend (after draining) so ComfyUI can take the GPU."""
     deadline = time.monotonic() + COMFY_WAIT_CAP
     while time.monotonic() < deadline:
         if _state["ft"] == "down":
             return True
         reachable = await _ft_probe() is not None
         inflight = _state["ft_inflight"]
-        stats = _state["last_stats"] or {}
-        active = int((stats.get("requests") or {}).get("active") or 0)
+        active = _stats_active(_state["last_stats"])
         if _state["ft"] != "waking" and reachable and inflight == 0 and active == 0:
-            log("parking ftserve for comfy job")
-            if await _systemctl("stop", "ftserve"):
+            log(f"parking {FT_UNIT} for comfy job")
+            if await _systemctl("stop", FT_UNIT):
                 _state["ft"] = "down"
                 return True
-            log("systemctl stop ftserve failed; retrying")
+            log(f"systemctl stop {FT_UNIT} failed; retrying")
         await asyncio.sleep(2)
-    log(f"comfy job timed out waiting for ftserve drain ({COMFY_WAIT_CAP}s)")
+    log(f"comfy job timed out waiting for LLM drain ({COMFY_WAIT_CAP}s)")
     return False
 
 
@@ -242,7 +279,7 @@ async def _handle_llm(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         try:
             if not await ensure_ft():
                 _reply(writer, "503 Service Unavailable",
-                       {"error": f"ftserve wake failed or timed out (> {FT_WAKE_CAP}s); retry soon"})
+                       {"error": f"{FT_UNIT} wake failed or timed out (> {FT_WAKE_CAP}s); retry soon"})
                 await writer.drain()
                 writer.close()
                 return
@@ -269,7 +306,7 @@ async def _handle_comfy(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         if method == "POST" and path in ("/prompt", "/api/prompt"):
             if not await ensure_gpu_for_comfy():
                 _reply(writer, "503 Service Unavailable",
-                       {"error": f"ftserve did not free the GPU within {COMFY_WAIT_CAP}s; retry"})
+                       {"error": f"{FT_UNIT} did not free the GPU within {COMFY_WAIT_CAP}s; retry"})
                 await writer.drain()
                 writer.close()
                 return
@@ -285,6 +322,7 @@ async def _handle_comfy(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 def _gateway_status() -> dict:
     return {
         "gpu_gateway": {
+            "ft_unit": FT_UNIT,
             "ft_state": _state["ft"],
             "ft_inflight": _state["ft_inflight"],
             "ft_idle_s": round(time.time() - _state["ft_last_active"], 1),
@@ -308,11 +346,9 @@ async def _governor() -> None:
                 and time.time() - _state["ft_last_active"] > FT_IDLE
             ):
                 await _ft_probe()
-                stats = _state["last_stats"] or {}
-                active = int((stats.get("requests") or {}).get("active") or 0)
-                if active == 0:
-                    log(f"ftserve idle > {FT_IDLE}s; parking to free VRAM")
-                    if await _systemctl("stop", "ftserve"):
+                if _stats_active(_state["last_stats"]) == 0:
+                    log(f"{FT_UNIT} idle > {FT_IDLE}s; parking to free VRAM")
+                    if await _systemctl("stop", FT_UNIT):
                         _state["ft"] = "down"
             if (
                 not _state["comfy_freed"]
@@ -352,7 +388,7 @@ async def main() -> None:
         _state["ft"] = "up"
     else:
         _state["ft"] = "down"
-    log(f"start: ft={_state['ft']} llm :{FT_PORT}->{FT_UP[1]} comfy :{COMFY_PORT}->{COMFY_UP[1]} "
+    log(f"start: ft={_state['ft']} unit={FT_UNIT} llm :{FT_PORT}->{FT_UP[1]} comfy :{COMFY_PORT}->{COMFY_UP[1]} "
         f"idle={FT_IDLE}s comfy_free={COMFY_FREE_IDLE}s wait_cap={COMFY_WAIT_CAP}s")
     asyncio.create_task(_governor())
     asyncio.create_task(_comfy_queue_watch())
