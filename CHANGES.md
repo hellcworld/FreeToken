@@ -532,6 +532,11 @@ llama-server 作为并行 LLM 后端,与 ftserve 互为备选。
   GGUF 元数据的 262K 训练窗口而非 `-c` 实际值,不显式覆盖的话 hermes 压缩要到
   ~196K 才触发,必然撞 64K 硬顶;设置后压缩在 0.75×64K=48K 输入触发(小窗 floor),
   保 system+头 3 条+尾 20 条,压后留 ~10K 尾巴,单轮生成余量 ~16K。
+- **公网聊天断连修复**("Chat connection interrupted" 无限重连):dashboard 的 WS
+  走同源 `/api/ws` + 一次性票据(`/api/auth/ws-ticket`),票据校验绑定
+  `dashboard.public_url`——之前配的是 LAN 地址,域名访问时票据/源校验 403。
+  `dashboard.public_url` → `https://hermes.infrafixed.com` 并重启后,公网全链
+  (CF 边缘→cloudflared→portproxy→caddy→dashboard)握手实测 **101** 通过。
 - **运维注意**:ftserve 不再被网关管理——手动启用前先 `systemctl stop bonsai`
   (两者各占 ~11GB 显存,同跑必 OOM);换回 ftserve 只需把 unit env 改回
   `FT_UNIT=ftserve FT_UP_PORT=8011` 后 `daemon-reload && restart gpu-gateway`。
