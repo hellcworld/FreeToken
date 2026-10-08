@@ -537,6 +537,17 @@ llama-server 作为并行 LLM 后端,与 ftserve 互为备选。
   `dashboard.public_url`——之前配的是 LAN 地址,域名访问时票据/源校验 403。
   `dashboard.public_url` → `https://hermes.infrafixed.com` 并重启后,公网全链
   (CF 边缘→cloudflared→portproxy→caddy→dashboard)握手实测 **101** 通过。
+- **9-26 WSL 重启事故复盘(2026-10-08 09:26)**:Windows Update 自动升级 WSL 商店包
+  (3.0.1.0)强制重启 WSL → systemd 世界重启,**ftproxy.service(DSH 时代残留,
+  `Wants=ftserve.service` 且开机自启)把 disabled 的 ftserve 拖起来抢占 GPU 10.8GB**
+  → 网关唤醒 bonsai 失败:8012 被一个身份未明的 uvicorn 风格 python3(pid 1051,
+  已自退)占用,每 0.05s "HTTP server error" 崩溃重启循环 → 请求堆积 inflight=484、
+  RAM 21Gi/23Gi。**修复**:停 ftserve 清端口后 bonsai 15s 恢复;ftproxy 已
+  `disable --now` 且单元文件删除 `Wants=/After=ftserve`(备份
+  `ftproxy.service.bak-1010`)——此后 WSL 重启不会再复活 ftserve。访问链路优化另证:
+  本网络直连 CF 104.16 网段(NTU 同段)走 **HKG 27ms**,优于域名自身解析的 104.21 网段
+  (SEA 170ms)与代理出口(LAX)——hosts 钉 `104.16.4.14` + 代理直连规则可大幅减少
+  WS 断联。
 - **运维注意**:ftserve 不再被网关管理——手动启用前先 `systemctl stop bonsai`
   (两者各占 ~11GB 显存,同跑必 OOM);换回 ftserve 只需把 unit env 改回
   `FT_UNIT=ftserve FT_UP_PORT=8011` 后 `daemon-reload && restart gpu-gateway`。
