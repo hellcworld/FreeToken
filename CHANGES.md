@@ -527,6 +527,11 @@ llama-server 作为并行 LLM 后端,与 ftserve 互为备选。
   生图 cap=8s → 503、流式无恙 ✓;生图门禁 "parking bonsai" 后透传(ComfyUI 正常
   校验 400)✓;FT_IDLE=90 → ~120s 停车、显存 **148MiB** ✓;`hermes -z` 经
   :8010 端到端 ✓。gpustat 已适配(llm health 指 :8012,stats 解析兼容两种形状)。
+- **Hermes 正式切到 bonsai**(随后):`model.default=bonsai2-27b` +
+  `model.context_length=65536`——后者是**必需项**:llama-server `/v1/models` 上报
+  GGUF 元数据的 262K 训练窗口而非 `-c` 实际值,不显式覆盖的话 hermes 压缩要到
+  ~196K 才触发,必然撞 64K 硬顶;设置后压缩在 0.75×64K=48K 输入触发(小窗 floor),
+  保 system+头 3 条+尾 20 条,压后留 ~10K 尾巴,单轮生成余量 ~16K。
 - **运维注意**:ftserve 不再被网关管理——手动启用前先 `systemctl stop bonsai`
   (两者各占 ~11GB 显存,同跑必 OOM);换回 ftserve 只需把 unit env 改回
   `FT_UNIT=ftserve FT_UP_PORT=8011` 后 `daemon-reload && restart gpu-gateway`。
