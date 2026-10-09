@@ -537,6 +537,13 @@ llama-server 作为并行 LLM 后端,与 ftserve 互为备选。
   `dashboard.public_url`——之前配的是 LAN 地址,域名访问时票据/源校验 403。
   `dashboard.public_url` → `https://hermes.infrafixed.com` 并重启后,公网全链
   (CF 边缘→cloudflared→portproxy→caddy→dashboard)握手实测 **101** 通过。
+- **切换到 abliterated(无审查)变体**(2026-10-09):模型换为
+  `BoldingBuilds/Ternary-Bonsai-2-27B-Abliterated-v2-PQ2_0-MTP-GGUF`(去审查消融版,
+  亦是 groxaxo 3060 榜单第一名 96% 所用文件);`--alias bonsai2-27b-abliterated`,
+  hermes `model.default` 同步更新。冒烟:decode 37.8/39.3 tok/s(同原版量级)、
+  工具调用规范、**官方 mmproj 与 abliterated 主模型兼容**(视觉正常)、常识正常、
+  MTP 接受率 0.4-1.0。原版 GGUF 保留在 models/bonsai2/ 可随时切回(改回 unit 的
+  -m 路径即可)。
 - **9-26 WSL 重启事故复盘(2026-10-08 09:26)**:Windows Update 自动升级 WSL 商店包
   (3.0.1.0)强制重启 WSL → systemd 世界重启,**ftproxy.service(DSH 时代残留,
   `Wants=ftserve.service` 且开机自启)把 disabled 的 ftserve 拖起来抢占 GPU 10.8GB**
