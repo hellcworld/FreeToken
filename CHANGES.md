@@ -544,6 +544,12 @@ llama-server 作为并行 LLM 后端,与 ftserve 互为备选。
   工具调用规范、**官方 mmproj 与 abliterated 主模型兼容**(视觉正常)、常识正常、
   MTP 接受率 0.4-1.0。原版 GGUF 保留在 models/bonsai2/ 可随时切回(改回 unit 的
   -m 路径即可)。
+- **Hermes 内部 gateway "degraded" 修复(2026-10-10)**:网页提示 degrade 的"网关"是
+  hermes 自身的消息 gateway 进程(独立于 dashboard 与 gpu-gateway),10-10 08:08 被
+  其 loop_liveness_watchdog 杀死且无自启机制,dashboard 一直显示陈旧的 degraded 状态
+  (顺带:期间 **WeChat 平台集成断连大半天**)。修复:`hermes gateway install` 装成
+  用户级 systemd 服务(`~/.config/systemd/user/hermes-gateway.service` + linger,
+  开机自启/崩溃自动拉起)→ `gateway_state: running`,weixin 重连。
 - **可用性调优(2026-10-10)**:(1) `FT_IDLE` 600→**1800**(空闲 30 分钟才停车,消除
   "空闲后首条消息等 10-20s"的高频观感;ComfyUI 门禁不受影响,生图前照常停车 bonsai);
   (2) **GPU 楔死自愈看门狗**:Windows 计划任务 `GPU-WSL-Watchdog`(SYSTEM/每 5 分钟,
