@@ -544,6 +544,13 @@ llama-server 作为并行 LLM 后端,与 ftserve 互为备选。
   工具调用规范、**官方 mmproj 与 abliterated 主模型兼容**(视觉正常)、常识正常、
   MTP 接受率 0.4-1.0。原版 GGUF 保留在 models/bonsai2/ 可随时切回(改回 unit 的
   -m 路径即可)。
+- **可用性调优(2026-10-10)**:(1) `FT_IDLE` 600→**1800**(空闲 30 分钟才停车,消除
+  "空闲后首条消息等 10-20s"的高频观感;ComfyUI 门禁不受影响,生图前照常停车 bonsai);
+  (2) **GPU 楔死自愈看门狗**:Windows 计划任务 `GPU-WSL-Watchdog`(SYSTEM/每 5 分钟,
+  `C:\ProgramData\gpu-watchdog\watchdog.ps1`)——`nvidia-smi` 挂起 >45s 判定楔死 →
+  强制重置 WslService(停不掉就杀进程)→ 等 WSL 起来后自动把 6 条 portproxy 重指向
+  当前 WSL IP → 复测;仍楔死则记日志提示人工重启。10-09 那种数小时瘫痪可压到 ~2 分钟。
+  诊断脚本:`diagnostics/gpu_watchdog.ps1`。
 - **9-26 WSL 重启事故复盘(2026-10-08 09:26)**:Windows Update 自动升级 WSL 商店包
   (3.0.1.0)强制重启 WSL → systemd 世界重启,**ftproxy.service(DSH 时代残留,
   `Wants=ftserve.service` 且开机自启)把 disabled 的 ftserve 拖起来抢占 GPU 10.8GB**
