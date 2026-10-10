@@ -556,7 +556,12 @@ llama-server 作为并行 LLM 后端,与 ftserve 互为备选。
   `C:\ProgramData\gpu-watchdog\watchdog.ps1`)——`nvidia-smi` 挂起 >45s 判定楔死 →
   强制重置 WslService(停不掉就杀进程)→ 等 WSL 起来后自动把 6 条 portproxy 重指向
   当前 WSL IP → 复测;仍楔死则记日志提示人工重启。10-09 那种数小时瘫痪可压到 ~2 分钟。
-  诊断脚本:`diagnostics/gpu_watchdog.ps1`。
+  **v2(同日,防误杀)**:单次探测→破坏性重置太糙——升级四重防护:(1) 同周期 30s 后
+  二次探测,瞬时抖动自愈不动作;(2) **冷加载豁免**:gateway `ft_state=waking`(模型
+  正在加载)时 nvidia-smi 慢是常态,绝不重置;(3) 需**连续两个周期**(≈10 分钟持续
+  楔死)才重置;(4) 重置限速:滚动 1 小时最多 3 次,超出只记日志。重置后 WSL 等待窗
+  120s→**240s**(10-10 14:50 实测强重置后 WSL 启动 >2min,过短会误报"救不回来")。
+  当日实战:GPU 4 次楔死全部自动恢复。脚本:`diagnostics/gpu_watchdog_v2.ps1`。
 - **9-26 WSL 重启事故复盘(2026-10-08 09:26)**:Windows Update 自动升级 WSL 商店包
   (3.0.1.0)强制重启 WSL → systemd 世界重启,**ftproxy.service(DSH 时代残留,
   `Wants=ftserve.service` 且开机自启)把 disabled 的 ftserve 拖起来抢占 GPU 10.8GB**
