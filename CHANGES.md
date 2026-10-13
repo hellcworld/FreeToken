@@ -39,8 +39,10 @@ gpu-gateway(:8010/8188 对外;scripts/gpu_gateway.py,后端无关:FT_UNIT 可切
   FT_WAKE_CAP=300(gpu-gateway.service Environment)
 - **自愈体系**:GPU 楔死看门狗 v2(Windows 计划任务 GPU-WSL-Watchdog,双探测+冷加载
   豁免+双周期确认+限速,`diagnostics/gpu_watchdog_v2.ps1`)→ 强重置 WslService +
-  自动修 portproxy;所有服务开机自启;hermes-gateway 为 linger 用户服务 + 每日
-  04:05 预防性重启(微信连接静默假死 2 次后加的兜底,详见 box-ops §3.2)
+  自动修 portproxy + 复位后重申 SM 频率上限;所有服务开机自启;hermes-gateway 为
+  linger 用户服务 + 每日 04:05 预防性重启(微信连接静默假死 2 次后加的兜底,详见
+  box-ops §3.2);GPU SM 上限常驻 1500MHz(开机任务 GPU-Clock-Cap,decode 无损/
+  负载功耗减半/prefill -12%)
 - **观测工具**(diagnostics/,不入库):`gpustat`(一屏状态)、`ftmon.py`(Windows
   Terminal 实时面板:CPU/RAM/GPU/decode/MTP)、`rexec.py`(SSH 通道)
 - **已知问题**:①盒子 GPU 驱动楔死为复发病(10-09/10-10 共 7 次,看门狗全自动恢复,
