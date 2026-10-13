@@ -78,8 +78,15 @@ Environment=LD_LIBRARY_PATH=.../build133/bin       # 动态链接库
 | **服务端 `--reasoning-budget 800`** | 12~54s | **采用**:思考硬上限 ~800 token(≈25s),预算内自然收束,超限强制截断 |
 
 强制性验证:budget=50 时思考被斩停在 83 字符(正中预算),正文照常输出 1261 字/25s。
+预算按 token 计(英文思考 ~4 字符/token,故 3100 字符≈800 token 属正常)。
+
+**2026-10-13 补丁(思考溢出事故)**:难题触顶预算后,默认预算消息拉不住该模型——
+它把推理用英文**继续写进正文**(微信实测一条 13327 字的"回复"全是思考文本)。
+修复:unit 增加 `--reasoning-budget-message "思考时间到。立即停止推理,直接用中文
+输出最终答案,不要再写任何推理过程。"`——五房子难题触顶后正文直接以"**结论:…**"
+开头输出规范答案,重定向验证通过。若换模型需重验此消息有效性。
 注意:hermes 对自定义 OpenAI-compat 后端**不下发** `reasoning_effort`(仅 Kimi/TokenHub/
-LM Studio 三类),所以只能服务端设,hermes 侧配置是空操作。回滚:unit 去掉该旗标,
+LM Studio 三类),所以只能服务端设,hermes 侧配置是空操作。回滚:unit 去掉这两个旗标,
 备份 `/etc/systemd/system/bonsai.service.bak-reasoning`。
 
 ---
