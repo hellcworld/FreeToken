@@ -29,7 +29,8 @@ gpu-gateway(:8010/8188 对外;scripts/gpu_gateway.py,后端无关:FT_UNIT 可切
       ├─ LLM: bonsai(llama-server :8012,PrismML fork b10754,CUDA 13.3 编译)
       │        模型 Ternary-Bonsai-2-27B-Abliterated-v2 PQ2_0+MTP(7.66GB,64K ctx,
       │        q8 KV,vision mmproj;decode 34-49 tok/s @短上下文、prefill ~500 tok/s
-      │        平坦到 64K;MTP 接受率 ~0.5@temp1.0)—— 空闲 30min 停车、请求唤醒 ~12s
+      │        平坦到 64K;MTP 接受率 ~0.5@temp1.0;--reasoning-budget 800 思考封顶
+      │        ~25s)—— 空闲 30min 停车、请求唤醒 ~12s
       ├─ ComfyUI(:8191,生图门禁:先排空停车 LLM 再放行;空闲 /free)
       └─ ftserve(:8011)退居手动备用(FT_UNIT 一键切回)
 ```
@@ -38,7 +39,8 @@ gpu-gateway(:8010/8188 对外;scripts/gpu_gateway.py,后端无关:FT_UNIT 可切
   FT_WAKE_CAP=300(gpu-gateway.service Environment)
 - **自愈体系**:GPU 楔死看门狗 v2(Windows 计划任务 GPU-WSL-Watchdog,双探测+冷加载
   豁免+双周期确认+限速,`diagnostics/gpu_watchdog_v2.ps1`)→ 强重置 WslService +
-  自动修 portproxy;所有服务开机自启;hermes-gateway 为 linger 用户服务
+  自动修 portproxy;所有服务开机自启;hermes-gateway 为 linger 用户服务 + 每日
+  04:05 预防性重启(微信连接静默假死 2 次后加的兜底,详见 box-ops §3.2)
 - **观测工具**(diagnostics/,不入库):`gpustat`(一屏状态)、`ftmon.py`(Windows
   Terminal 实时面板:CPU/RAM/GPU/decode/MTP)、`rexec.py`(SSH 通道)
 - **已知问题**:①盒子 GPU 驱动楔死为复发病(10-09/10-10 共 7 次,看门狗全自动恢复,
@@ -614,6 +616,20 @@ llama-server 作为并行 LLM 后端,与 ftserve 互为备选。
 - **运维注意**:ftserve 不再被网关管理——手动启用前先 `systemctl stop bonsai`
   (两者各占 ~11GB 显存,同跑必 OOM);换回 ftserve 只需把 unit env 改回
   `FT_UNIT=ftserve FT_UP_PORT=8011` 后 `daemon-reload && restart gpu-gateway`。
+- **微信网关静默假死(2026-10-12/10-13 各一次)**:hermes-gateway 进程活着、
+  `/api/status` 的 weixin.state 仍报 connected(陈旧)、日志零报错,但 inbound 完全
+  停止(gateway.log 最后一条 `[Weixin] inbound` 停在 08:25,之后只有 housekeeping)。
+  两次均 `systemctl --user restart hermes-gateway` 秒愈。兜底:linger 用户定时器
+  `hermes-gateway-refresh.timer` 每日 04:05 预防性重启;诊断口诀见 box-ops §3.2
+  (看 gateway.log 的 inbound 时间戳,别信 /api/status)。
+- **思考预算封顶(2026-10-13)**:微信回复 105~558s 的主因是 temp 1.0 下思维链长度
+  方差极大(500~5000+ token)。对照实验 6 方案定案:**请求级 `reasoning_effort=low`
+  会触发失控思考(6000 token 打满、零正文输出,官方 KNOWN_ISSUES 的 reasoning budget
+  问题实锤),严禁使用;`none`/`enable_thinking=false` 有效但全关**;最终在
+  bonsai.service 加 **`--reasoning-budget 800`**(服务端硬上限,hermes 对自定义
+  OpenAI-compat 后端不下发 reasoning_effort,只能服务端设)——budget=50 强制性
+  验证思考被斩停在正中预算,正文照常输出;实测文案/数学 12~54s。回滚备份
+  `bonsai.service.bak-reasoning`。
 
 ## 版本说明 / Versioning
 

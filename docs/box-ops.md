@@ -32,6 +32,7 @@ ExecStart=.../llama-server \
   --image-min-tokens 1024 --host 127.0.0.1 --port 8012 \
   -np 1 --cache-ram 8192 \
   --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0 \    # 采样兜底=模型卡思考档(GGUF 元数据缺采样参数,必须显式设)
+  --reasoning-budget 800 \   # 思考 token 硬上限(~25s);防失控思考,见 1.5
   --alias bonsai2-27b-abliterated
 Environment=LD_LIBRARY_PATH=.../build133/bin       # 动态链接库
 ```
@@ -56,6 +57,25 @@ Environment=LD_LIBRARY_PATH=.../build133/bin       # 动态链接库
 - 手动启停:`systemctl stop ftserve && systemctl start bonsai`(反之亦然)
 - **换回原版 GGUF**:unit 里 `-m` 路径改回原版文件 → `daemon-reload && restart bonsai`
 - **换回 ftserve 引擎**:见 2.4
+
+### 1.5 思考预算(`--reasoning-budget 800`,2026-10-13 实测定案)
+
+背景:temp 1.0 下思维链长度方差极大(同一条文案请求 500~5000+ token 都出现过),
+微信回复实测 105~558s。对照实验(同一提示,5 方案):
+
+| 方案 | 耗时 | 结论 |
+|---|---|---|
+| 基线 | 23s~9min(方差) | 思考量不可控 |
+| 请求级 `reasoning_effort=low` | 153s,**6000 token 打满、0 字回复** | **禁止使用**——该档位触发失控思考(官方 KNOWN_ISSUES 实锤) |
+| 请求级 `reasoning_effort=none` | 6s | 思考全关,质量仍可 |
+| 请求级 `enable_thinking=false` | 8s | 同上(Qwen 官方模板开关) |
+| 提示词 `/no_think` 标签 | 26s | **无效**,模型照思考 |
+| **服务端 `--reasoning-budget 800`** | 12~54s | **采用**:思考硬上限 ~800 token(≈25s),预算内自然收束,超限强制截断 |
+
+强制性验证:budget=50 时思考被斩停在 83 字符(正中预算),正文照常输出 1261 字/25s。
+注意:hermes 对自定义 OpenAI-compat 后端**不下发** `reasoning_effort`(仅 Kimi/TokenHub/
+LM Studio 三类),所以只能服务端设,hermes 侧配置是空操作。回滚:unit 去掉该旗标,
+备份 `/etc/systemd/system/bonsai.service.bak-reasoning`。
 
 ---
 
@@ -115,8 +135,23 @@ ComfyUI UI/caddy  ──> :8188 网关 ──> ComfyUI :8191
 | hermes-dashboard | 系统服务 :9119 | 网页版 UI + API(重启会断开所有页面 WS,数秒) |
 | hermes-gateway | **linger 用户服务**(`~/.config/systemd/user/`) | 消息平台集成(微信),开机自启/崩溃拉起 |
 | hermes CLI | `runuser -u adminuser -- hermes ...` | 配置/一次性任务(`-z`) |
+| hermes-gateway-refresh.timer | linger 用户定时器,**每日 04:05** | 预防性重启微信网关(见 3.2) |
 
-### 3.2 关键配置(`~/.hermes/config.yaml`,改后重启对应服务)
+### 3.2 微信连接静默假死(已复发 2 次,运维必读)
+
+病症:hermes-gateway 进程 active、`/api/status` 微信平台仍显示 connected(陈旧
+状态)、journal/errors.log **零报错**,但 inbound 完全停止——用户消息根本不达。
+发作史:10-12 08:08 起 >5h、10-13 08:25 起 ~40min,两次均靠重启恢复。
+
+- **诊断法**:看 `~/.hermes/logs/gateway.log` 尾部——最后一条 `[Weixin] inbound`
+  的时间距现在多久;只有 housekeeping/mem_trim 在刷=假死实锤(`/api/status` 的
+  weixin.state 不可信)
+- **处置**:`runuser -u adminuser -- env XDG_RUNTIME_DIR=/run/user/1000
+  systemctl --user restart hermes-gateway`(约 20s 重连)
+- **预防**:每日 04:05 定时重启(已装);若复发周期 <1 天再考虑基于 gateway.log
+  inbound 心跳的探测式重启
+
+### 3.3 关键配置(`~/.hermes/config.yaml`,改后重启对应服务)
 
 | 键 | 现值 | 为什么 |
 |---|---|---|
@@ -126,7 +161,7 @@ ComfyUI UI/caddy  ──> :8188 网关 ──> ComfyUI :8191
 | dashboard.public_url | https://hermes.infrafixed.com | **必设为公网域名**:WS 一次性票据校验绑定此值,错配=聊天无限重连(已修) |
 | dashboard.basic_auth | admin / *(scrypt)* | 网页登录层 |
 
-### 3.3 公网链路
+### 3.4 公网链路
 
 ```
 浏览器 → CF 边缘 → Windows cloudflared 服务(token 隧道)
