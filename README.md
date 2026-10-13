@@ -3,7 +3,8 @@
 > **Fork notice** · This is a personal fork of
 > [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) (Apache-2.0)
 > adding **Qwen3.8-27B NVFP4 support (both quant dialects)** and
-> **Qwen3.5/3.6/3.8 vision input** (gemma4-parity) on top of upstream `main@2757bb5`.
+> **Qwen3.5/3.6/3.8 vision input** (gemma4-parity) on top of upstream `main@2757bb5`,
+> plus a **GPU time-sharing gateway** for single-GPU LLM + ComfyUI boxes.
 > Changes, verification status and versioning: **[CHANGES.md](CHANGES.md)** ·
 > fork tag `qwen38-vision-v1.0.0`.
 
@@ -25,7 +26,7 @@ Unlock datacenter-class intelligence on the hardware you already own — Run 290
 
 ## ✨ What's New in This Fork
 
-Four features layered on upstream `main@2757bb5` (details & verification: [CHANGES.md](CHANGES.md)):
+Four engine features plus one ops feature, layered on upstream `main@2757bb5` (details & verification: [CHANGES.md](CHANGES.md)):
 
 **1 · Qwen3.8-27B NVFP4 support — both quant dialects**
 
@@ -100,6 +101,21 @@ checkpoints, Triton backend, TP=1; non-greedy requests automatically fall back t
 plain cycles. GPU-validated on RTX 3060 + WSL2: greedy outputs token-identical
 plain vs spec (lossless), 1.28x throughput at K=2 even with a random-weight draft
 head (zero acceptance still nets out ahead via verify-pass row amortization).
+
+**5 · GPU time-sharing gateway (`scripts/gpu_gateway.py`)**
+
+```bash
+python3 gpu_gateway.py   # front ports :8010/:8188; backends: ftserve or llama-server
+```
+A ~400-line pure-stdlib asyncio front proxy that lets one GPU serve an LLM and
+ComfyUI alternately: inference requests wake a parked backend (single-flight,
+held until `/health` is ok), idle parking frees ~11 GB VRAM (`FT_IDLE`), and
+ComfyUI `/prompt` submissions drain-and-park the LLM first (wait cap → 503).
+Backend-agnostic (`FT_UNIT` swaps the systemd unit; `/slots` and `/v1/stats`
+stats are normalized) — this is what runs the fork author's box: a 27B ternary
+llama-server and ComfyUI time-sharing an RTX 3060 12 GB behind stable ports,
+with a Hermes agent stack on top (CHANGES.md §9–11, incl. a self-healing GPU
+watchdog and live monitoring panel).
 
 ## About
 

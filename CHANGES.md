@@ -8,6 +8,41 @@
 |---|---|
 | `f1535a1` | **Qwen3.8-27B NVFP4 双方言支持**(修复 #139 一类加载崩溃) |
 | `89d2189` | **Qwen3.5/3.6/3.8 视觉输入**(对齐 gemma4 的支持级别) |
+| `98739bd`+ | **GPU 分时网关 + 盒子运行栈**(九~十一章,见下) |
+
+## 〇、当前运行栈速览(2026-10-10)
+
+开发机 → 盒子(192.168.100.116 = Windows + WSL Ubuntu,RTX 3060 12GB / 23GB RAM)
+的完整自托管 LLM + 图像栈。引擎层改动见一~八章;运行层(九~十一章)现状:
+
+```
+用户 ── https://hermes.infrafixed.com ── Cloudflare 边缘(优选 IP 104.16.x 走 HKG 27ms)
+      │            (Windows cloudflared 隧道 + caddy basic_auth :8187)
+      ▼
+Hermes Agent(dashboard :9119 + 消息 gateway 微信集成,均为 systemd 服务)
+      │ model.base_url = http://127.0.0.1:8010/v1, context_length=65536
+      ▼
+gpu-gateway(:8010/8188 对外;scripts/gpu_gateway.py,后端无关:FT_UNIT 可切)
+      ├─ LLM: bonsai(llama-server :8012,PrismML fork b10754,CUDA 13.3 编译)
+      │        模型 Ternary-Bonsai-2-27B-Abliterated-v2 PQ2_0+MTP(7.66GB,64K ctx,
+      │        q8 KV,vision mmproj;decode 34-49 tok/s @短上下文、prefill ~500 tok/s
+      │        平坦到 64K;MTP 接受率 ~0.5@temp1.0)—— 空闲 30min 停车、请求唤醒 ~12s
+      ├─ ComfyUI(:8191,生图门禁:先排空停车 LLM 再放行;空闲 /free)
+      └─ ftserve(:8011)退居手动备用(FT_UNIT 一键切回)
+```
+
+- **关键参数**:FT_IDLE=1800 / COMFY_FREE_IDLE=300 / COMFY_WAIT_CAP=600 /
+  FT_WAKE_CAP=300(gpu-gateway.service Environment)
+- **自愈体系**:GPU 楔死看门狗 v2(Windows 计划任务 GPU-WSL-Watchdog,双探测+冷加载
+  豁免+双周期确认+限速,`diagnostics/gpu_watchdog_v2.ps1`)→ 强重置 WslService +
+  自动修 portproxy;所有服务开机自启;hermes-gateway 为 linger 用户服务
+- **观测工具**(diagnostics/,不入库):`gpustat`(一屏状态)、`ftmon.py`(Windows
+  Terminal 实时面板:CPU/RAM/GPU/decode/MTP)、`rexec.py`(SSH 通道)
+- **已知问题**:①盒子 GPU 驱动楔死为复发病(10-09/10-10 共 7 次,看门狗全自动恢复,
+  WSL 3.0.1.0 更新为头号嫌疑);②调度器"空闲后首请求楔死"(ftserve 时代,四章,
+  现已不跑 ftserve 常驻);③ftserve 调度 anomaly(六章)——引擎层未修,详见各章
+- **回滚**:LLM 换回 ftserve = unit env 改 `FT_UNIT=ftserve FT_UP_PORT=8011` +
+  restart;bonsai 换回原版 GGUF = unit 改 `-m` 路径(两个文件都在 models/bonsai2/)
 
 ## 一、Qwen3.8-27B NVFP4 支持(`f1535a1`)
 

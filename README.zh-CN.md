@@ -5,7 +5,8 @@
 > **Fork 声明** · 本仓库是
 > [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken)(Apache-2.0)的个人
 > fork,在上游 `main@2757bb5` 之上新增了 **Qwen3.8-27B NVFP4 支持(两种量化方言)**
-> 与 **Qwen3.5/3.6/3.8 视觉输入**(对齐 gemma4 的支持级别)。
+> 与 **Qwen3.5/3.6/3.8 视觉输入**(对齐 gemma4 的支持级别),
+> 另附 **GPU 分时网关**(单卡 LLM + ComfyUI 合用一卡)。
 > 变更详情、验证状态与版本说明见 **[CHANGES.md](CHANGES.md)** ·
 > fork 标签 `qwen38-vision-v1.0.0`。
 
@@ -27,7 +28,7 @@
 
 ## ✨ 本 Fork 新增能力
 
-在上游 `main@2757bb5` 之上叠加四个功能(详情与验证:[CHANGES.md](CHANGES.md)):
+在上游 `main@2757bb5` 之上叠加五个功能(详情与验证:[CHANGES.md](CHANGES.md)):
 
 **1 · Qwen3.8-27B NVFP4 支持——两种量化方言**
 
@@ -84,6 +85,18 @@ ft serve --model Qwen3.8-27B --speculative-algorithm MTP --speculative-num-draft
 草稿头持有共享页表下的独立 KV slab,前缀缓存复用、页分配与拒绝回滚全部复用
 现有机制。phase 1 范围:纯 MHA/GQA 的 Qwen3.5 家族稠密模型、Triton 后端、TP=1;
 非 greedy 请求自动降级为普通周期。
+
+**5 · GPU 分时网关(`scripts/gpu_gateway.py`)**
+
+```bash
+python3 gpu_gateway.py   # 对外 :8010/:8188;后端可为 ftserve 或 llama-server
+```
+约 400 行纯标准库 asyncio 前置代理,让一张 GPU 轮流服务 LLM 与 ComfyUI:推理
+请求唤醒已停车的后端(single-flight,扣住到 `/health` ok)、空闲自动停车释放
+~11GB 显存(`FT_IDLE`)、ComfyUI `/prompt` 先排空停车 LLM 再放行(超时 503)。
+后端无关(`FT_UNIT` 切换单元;/slots 与 /v1/stats 统计归一)——本 fork 作者的
+盒子即以它运转:RTX 3060 12GB 上 27B 三值 llama-server 与 ComfyUI 分时共享、
+Hermes 智能体栈叠其上(CHANGES.md 九~十一章,含自愈看门狗与监控面板)。
 
 ## 简介
 
