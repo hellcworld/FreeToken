@@ -624,6 +624,16 @@ llama-server 作为并行 LLM 后端,与 ftserve 互为备选。
   两次均 `systemctl --user restart hermes-gateway` 秒愈。兜底:linger 用户定时器
   `hermes-gateway-refresh.timer` 每日 04:05 预防性重启;诊断口诀见 box-ops §3.2
   (看 gateway.log 的 inbound 时间戳,别信 /api/status)。
+- **WSL 3.0.1.0 总清算:回退 2.7.14(2026-10-15)**:微信"崩了"入口 → 深挖发现
+  三层病:①WSL 10-13 20:04 被关停后无自愈(全栈暗 1.5 天);②**WSL 3.x 设计行为:
+  最后一个 wsl.exe 会话关闭 ~15s 即拆除整个发行版用户空间,systemd 服务不算数**
+  (此前全靠用户恰好开着的终端窗口吊命);③WSL vSwitch 路由反复断。处置:先部署
+  Windows 计划任务三件套(WSL-Stack-Boot 开机自启 / Keepalive 每 10 分钟拉起+
+  portproxy 自动重指 / Hold 常驻会话循环)+ .wslconfig `vmIdleTimeout=-1`,但 3.0.1.0
+  下 SYSTEM 会话持不稳;最终 **下载 WSL 2.7.14 x64 MSI(259MB)经 SFTP 上盒,
+  直接覆盖安装完成版本回退**——内核 6.18.33.2-2,GPU 正常,**9 分钟零客户端会话
+  全栈存活、微信在线,验收通过**。安装包留存盒上 C:\Users\admin\wsl_2.7.14.msi;
+  WSL 2.6.1 有同类"关终端即关机"回归史,别选它,也别让 Windows Update 再推 3.x。
 - **WSL 关停无自愈事故(2026-10-13 20:04 发现于 10-15 08:21)**:WSL 被关停后
   (Windows 未重启、看门狗静默)整个栈——微信/网页/LLM/生图——暗了 1.5 天,无任何
   机制拉起,最终靠一次偶然的 wsl 调用才唤醒。根治:Windows 计划任务双保险
