@@ -209,24 +209,32 @@ nvidia-smi 探测(45s)
 日志:`C:\ProgramData\gpu-watchdog\watchdog.log`(+`state.txt` 连续计数/重置时间戳)。
 脚本源:`diagnostics/gpu_watchdog_v2.ps1`。
 
-### 4.2 开机自愈矩阵(WSL 重启后谁来拉起什么)
+### 4.2 开机自愈矩阵(WSL 2.7.14 时代,2026-10-15 重写)
 
 | 组件 | 启动方式 |
 |---|---|
-| **WSL 本体** | **Windows 计划任务双保险**:`WSL-Stack-Boot`(开机触发)+ `WSL-Stack-Keepalive`(每 10 分钟),均跑 `C:\ProgramData\gpu-watchdog\keepalive.ps1`——拉起 WSL + WSL IP 变化时自动重指 6 条 portproxy(日志 keepalive.log)。**2026-10-13 20:04 事故**:WSL 被关停后无任何机制拉起,全栈(含微信/公网)暗了 1.5 天,靠偶然的 wsl 调用才醒——此双任务即根治 |
-| gpu-gateway / comfyui / hermes-dashboard / caddy | 系统服务自启(hermes-dashboard 冷启动可能闪退一次,Restart= 会拉回,~10s) |
-| hermes-gateway(微信) | linger 用户服务,随 boot 拉起(实测开机 3 秒内;错过的 04:05 刷新由 Persistent 定时器补跑) |
+| **WSL 本体** | 三重保险:计划任务 `WSL-Stack-Boot`(Windows 开机)+ `WSL-Stack-Keepalive`(每 10 分钟,执行 `gpu-watchdog/keepalive.ps1`:拉起 WSL+IP 变化重指 6 条 portproxy)+ `WSL-Stack-Hold`(常驻循环,持续持有一个 wsl 客户端会话,`holdtask2.ps1`) |
+| gpu-gateway / comfyui / hermes-dashboard / caddy | 系统服务自启 |
+| hermes-gateway(微信) | linger 用户服务,随 boot 拉起;错过的 04:05 刷新由 Persistent 定时器补跑 |
 | bonsai | **不启动**,首个 LLM 请求唤醒(~12s) |
-| ftserve | **不会**启动(ftproxy 已 disable 且 Wants=ftserve 已拆,2026-10-08 事故根治) |
+| ftserve | **不会**启动(ftproxy 已 disable 且 Wants=ftserve 已拆) |
 
-keepalive 验收实测(2026-10-15):手动 `wsl --shutdown` → 全栈灭 → keepalive 任务 1 分钟内拉起 WSL → 服务全绿 + 微信重连 + portproxy 有效。删除自愈:`schtasks /delete /tn WSL-Stack-Boot /f && schtasks /delete /tn WSL-Stack-Keepalive /f`。
+**WSL 版本纪律(血泪教训)**:盒子必须停留在 **WSL 2.7.14 MSI**(已装,
+安装包留存 `C:\Users\admin\wsl_2.7.14.msi`)。**WSL 3.0.1.0(10-08 Windows Update
+自动升的商店版)是 10-08 以来全部怪病的总根**:①GPU 楔死病(10-09/10-10 共 7 次);
+②**"无客户端会话 ~15s 即拆除整个用户空间"(设计行为,systemd 服务不算数)——
+10-13 20:04 起 1.5 天黑栈与 10-15 早上的 30 秒级重启循环都是它**;③WSL vSwitch
+抽风(Windows→WSL IP 路由反复断)。2.7.14 实测:9 分钟零客户端会话全栈存活。
+`wsl --version` 应报 2.7.14.0;若 Windows Update 日后再度推送 WSL 升级,
+第一怀疑对象就是它。另:.wslconfig 含 `vmIdleTimeout=-1`(VM 空闲关机禁用,双保险)。
 
 ### 4.3 战绩与边界
 
 - 10-09:驱动楔死大半天无自愈(看门狗前身)→ 10-10:同病 4 次全部 2-5 分钟自愈
+- 10-13~10-15:WSL 3.0.1.0 综合征全面爆发(黑栈 1.5 天、无会话拆用户空间、
+  vSwitch 断路由)→ **10-15 回退 WSL 2.7.14 后清零**;回退前的 keepalive/hold
+  三件套保留作保险
 - 边界:驱动级救不回时看门狗放弃并提示手动重启;重置会断当时活跃会话(设计取舍)
-- 病根未除:WSL 3.0.1.0(10-08 更新)为头号嫌疑,高频复发时考虑回退商店包或升级
-  NVIDIA 驱动(616.92)
 
 ---
 
