@@ -228,6 +228,13 @@ nvidia-smi 探测(45s)
 `wsl --version` 应报 2.7.14.0;若 Windows Update 日后再度推送 WSL 升级,
 第一怀疑对象就是它。另:.wslconfig 含 `vmIdleTimeout=-1`(VM 空闲关机禁用,双保险)。
 
+**已部署的防升级三件套(2026-10-15)**:①注册表策略
+`HKLM\SOFTWARE\Policies\Microsoft\WindowsStore AutoDownload=2`(禁用商店应用
+自动更新——10-08 推 3.0.1.0 的主通道);②新版商店包 Microsoft.WSL 已被 MSI 安装
+清除,仅剩 MSI 注册的 2.7.14;③keepalive.ps1 内置**版本哨兵**:每次运行检查
+`wsl --version`,偏离 2.7.14 即在 keepalive.log 写 !!! 告警(含回退命令)。
+手动升级/回退:`msiexec /i C:\Users\admin\wsl_2.7.14.msi /qn`(该 MSI 是 x64 2.7.14)。
+
 ### 4.3 战绩与边界
 
 - 10-09:驱动楔死大半天无自愈(看门狗前身)→ 10-10:同病 4 次全部 2-5 分钟自愈
