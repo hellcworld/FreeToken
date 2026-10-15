@@ -624,6 +624,12 @@ llama-server 作为并行 LLM 后端,与 ftserve 互为备选。
   两次均 `systemctl --user restart hermes-gateway` 秒愈。兜底:linger 用户定时器
   `hermes-gateway-refresh.timer` 每日 04:05 预防性重启;诊断口诀见 box-ops §3.2
   (看 gateway.log 的 inbound 时间戳,别信 /api/status)。
+- **WSL 关停无自愈事故(2026-10-13 20:04 发现于 10-15 08:21)**:WSL 被关停后
+  (Windows 未重启、看门狗静默)整个栈——微信/网页/LLM/生图——暗了 1.5 天,无任何
+  机制拉起,最终靠一次偶然的 wsl 调用才唤醒。根治:Windows 计划任务双保险
+  `WSL-Stack-Boot`(开机)+ `WSL-Stack-Keepalive`(每 10 分钟),执行
+  `gpu-watchdog/keepalive.ps1`(拉起 WSL + WSL IP 变化自动重指 6 条 portproxy)。
+  验收:手动 `wsl --shutdown` 全栈灭 → 1 分钟内全自动恢复含微信重连。
 - **思考预算封顶(2026-10-13)**:微信回复 105~558s 的主因是 temp 1.0 下思维链长度
   方差极大(500~5000+ token)。对照实验 6 方案定案:**请求级 `reasoning_effort=low`
   会触发失控思考(6000 token 打满、零正文输出,官方 KNOWN_ISSUES 的 reasoning budget

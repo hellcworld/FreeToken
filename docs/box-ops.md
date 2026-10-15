@@ -213,10 +213,13 @@ nvidia-smi 探测(45s)
 
 | 组件 | 启动方式 |
 |---|---|
-| gpu-gateway / comfyui / hermes-dashboard / caddy | 系统服务自启 |
-| hermes-gateway(微信) | linger 用户服务,随 boot 拉起(实测开机 3 秒内) |
+| **WSL 本体** | **Windows 计划任务双保险**:`WSL-Stack-Boot`(开机触发)+ `WSL-Stack-Keepalive`(每 10 分钟),均跑 `C:\ProgramData\gpu-watchdog\keepalive.ps1`——拉起 WSL + WSL IP 变化时自动重指 6 条 portproxy(日志 keepalive.log)。**2026-10-13 20:04 事故**:WSL 被关停后无任何机制拉起,全栈(含微信/公网)暗了 1.5 天,靠偶然的 wsl 调用才醒——此双任务即根治 |
+| gpu-gateway / comfyui / hermes-dashboard / caddy | 系统服务自启(hermes-dashboard 冷启动可能闪退一次,Restart= 会拉回,~10s) |
+| hermes-gateway(微信) | linger 用户服务,随 boot 拉起(实测开机 3 秒内;错过的 04:05 刷新由 Persistent 定时器补跑) |
 | bonsai | **不启动**,首个 LLM 请求唤醒(~12s) |
 | ftserve | **不会**启动(ftproxy 已 disable 且 Wants=ftserve 已拆,2026-10-08 事故根治) |
+
+keepalive 验收实测(2026-10-15):手动 `wsl --shutdown` → 全栈灭 → keepalive 任务 1 分钟内拉起 WSL → 服务全绿 + 微信重连 + portproxy 有效。删除自愈:`schtasks /delete /tn WSL-Stack-Boot /f && schtasks /delete /tn WSL-Stack-Keepalive /f`。
 
 ### 4.3 战绩与边界
 
