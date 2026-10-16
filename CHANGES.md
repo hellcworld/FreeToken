@@ -624,6 +624,11 @@ llama-server 作为并行 LLM 后端,与 ftserve 互为备选。
   两次均 `systemctl --user restart hermes-gateway` 秒愈。兜底:linger 用户定时器
   `hermes-gateway-refresh.timer` 每日 04:05 预防性重启;诊断口诀见 box-ops §3.2
   (看 gateway.log 的 inbound 时间戳,别信 /api/status)。
+- **froggeric 固化聊天模板上线(2026-10-15)**:bonsai.service 加 `--chat-template-file`
+  指向 froggeric/Qwen-Fixed-Chat-Templates v22.5(`qwen3.8-froggeric-v22.5`,单文件
+  覆盖 3.5/3.6/3.8,vision 内建)。默认思考档 xhigh→medium;修复工具调用/思考定界/
+  流式;冒烟通过(文案 36s/难题 89s 无泄漏/视觉 15.8s 读图准确)。模板留存
+  models/bonsai2/,回滚备份 bonsai.service.bak-template。
 - **WSL 3.0.1.0 总清算:回退 2.7.14(2026-10-15)**:微信"崩了"入口 → 深挖发现
   三层病:①WSL 10-13 20:04 被关停后无自愈(全栈暗 1.5 天);②**WSL 3.x 设计行为:
   最后一个 wsl.exe 会话关闭 ~15s 即拆除整个发行版用户空间,systemd 服务不算数**

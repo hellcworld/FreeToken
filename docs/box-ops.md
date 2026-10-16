@@ -28,7 +28,8 @@ ExecStart=.../llama-server \
   -m .../models/bonsai2/Ternary-Bonsai-2-27B-Abliterated-v2-PQ2_0-MTP.gguf \
   --mmproj .../models/bonsai2/Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf   # 官方视觉投影,与 abliterated 主模型兼容
   -ngl 999 -fa on -c 65536 -ctk q8_0 -ctv q8_0 \   # 全层进显存;64K 上下文;KV q8 量化(~1.5GB)
-  --jinja --spec-type draft-mtp --spec-draft-n-max 2 \   # 模型聊天模板;MTP 投机(2 草稿)
+  --jinja --spec-type draft-mtp --spec-draft-n-max 2 \   # MTP 投机(2 草稿)
+  --chat-template-file /home/adminuser/models/bonsai2/chat_template_froggeric_v22.5.jinja \  # froggeric 固化模板(见 1.5)
   --image-min-tokens 1024 --host 127.0.0.1 --port 8012 \
   -np 1 --cache-ram 8192 \
   --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0 \    # 采样兜底=模型卡思考档(GGUF 元数据缺采样参数,必须显式设)
@@ -85,6 +86,12 @@ Environment=LD_LIBRARY_PATH=.../build133/bin       # 动态链接库
 修复:unit 增加 `--reasoning-budget-message "思考时间到。立即停止推理,直接用中文
 输出最终答案,不要再写任何推理过程。"`——五房子难题触顶后正文直接以"**结论:…**"
 开头输出规范答案,重定向验证通过。若换模型需重验此消息有效性。
+**2026-10-15 模板更换**:unit 增加 `--chat-template-file .../chat_template_froggeric_v22.5.jinja`
+(froggeric/Qwen-Fixed-Chat-Templates v22.5,单文件覆盖 Qwen3.5/3.6/3.8,vision 内建)。
+相对原生模板:默认思考档 **xhigh→medium**(回复更利落)、修复工具调用/思考定界/流式
+问题、思考档可用 low/medium/xhigh/none + 粘性标签切换。冒烟:文案 36s 干净;难题
+89s 思考有界无泄漏;**视觉 15.8s 准确读图**(image placeholder 兼容)。回滚:unit 去掉
+该旗标+restart(备份 `bonsai.service.bak-template`)。
 注意:hermes 对自定义 OpenAI-compat 后端**不下发** `reasoning_effort`(仅 Kimi/TokenHub/
 LM Studio 三类),所以只能服务端设,hermes 侧配置是空操作。回滚:unit 去掉这两个旗标,
 备份 `/etc/systemd/system/bonsai.service.bak-reasoning`。
