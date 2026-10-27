@@ -33,7 +33,7 @@ ExecStart=.../llama-server \
   --image-min-tokens 1024 --host 127.0.0.1 --port 8012 \
   -np 1 --cache-ram 8192 \
   --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0 \    # 采样兜底=模型卡思考档(GGUF 元数据缺采样参数,必须显式设)
-  --reasoning-budget 800 \   # 思考 token 硬上限(~25s);防失控思考,见 1.5
+  --reasoning-budget 1600 \  # 思考 token 硬上限(~50s;2026-10-27 从 800 上调);防失控思考,见 1.5
   --alias bonsai2-27b-abliterated
 Environment=LD_LIBRARY_PATH=.../build133/bin       # 动态链接库
 ```
@@ -76,7 +76,7 @@ Environment=LD_LIBRARY_PATH=.../build133/bin       # 动态链接库
 | 请求级 `reasoning_effort=none` | 6s | 思考全关,质量仍可 |
 | 请求级 `enable_thinking=false` | 8s | 同上(Qwen 官方模板开关) |
 | 提示词 `/no_think` 标签 | 26s | **无效**,模型照思考 |
-| **服务端 `--reasoning-budget 800`** | 12~54s | **采用**:思考硬上限 ~800 token(≈25s),预算内自然收束,超限强制截断 |
+| **服务端 `--reasoning-budget 1600`** | 12~60s | **采用**(2026-10-27 由 800 上调,思考上限 ≈50s):预算内自然收束,超限强制截断+中文重定向 |
 
 强制性验证:budget=50 时思考被斩停在 83 字符(正中预算),正文照常输出 1261 字/25s。
 预算按 token 计(英文思考 ~4 字符/token,故 3100 字符≈800 token 属正常)。

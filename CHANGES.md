@@ -624,6 +624,8 @@ llama-server 作为并行 LLM 后端,与 ftserve 互为备选。
   两次均 `systemctl --user restart hermes-gateway` 秒愈。兜底:linger 用户定时器
   `hermes-gateway-refresh.timer` 每日 04:05 预防性重启;诊断口诀见 box-ops §3.2
   (看 gateway.log 的 inbound 时间戳,别信 /api/status)。
+- **思考预算 800→1600(2026-10-27)**:unit `--reasoning-budget 1600`(思考上限
+  ~50s),中文重定向消息保留;等在途请求排空后重启,冒烟 4s 通过。
 - **96K 上下文 + q4 KV(2026-10-27)**:用户让 hermes 改配置但被其工具策略拦截
   (拒绝写 /etc/systemd 敏感路径——护栏行为,非故障);人工执行:unit 改
   `-c 98304 -ctk q4_0 -ctv q4_0`(KV 1.1GB < 64K q8 的 1.5GB,显存 11.8/12.3GB),
