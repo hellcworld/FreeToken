@@ -624,6 +624,11 @@ llama-server 作为并行 LLM 后端,与 ftserve 互为备选。
   两次均 `systemctl --user restart hermes-gateway` 秒愈。兜底:linger 用户定时器
   `hermes-gateway-refresh.timer` 每日 04:05 预防性重启;诊断口诀见 box-ops §3.2
   (看 gateway.log 的 inbound 时间戳,别信 /api/status)。
+- **96K 上下文 + q4 KV(2026-10-27)**:用户让 hermes 改配置但被其工具策略拦截
+  (拒绝写 /etc/systemd 敏感路径——护栏行为,非故障);人工执行:unit 改
+  `-c 98304 -ctk q4_0 -ctv q4_0`(KV 1.1GB < 64K q8 的 1.5GB,显存 11.8/12.3GB),
+  hermes context_length 同步 98304(压缩触发 ~73.7K),带失败自动回滚的脚本执行,
+  冒烟 7s 通过。备份 `bonsai.service.bak-q496`。
 - **froggeric 固化聊天模板上线(2026-10-15)**:bonsai.service 加 `--chat-template-file`
   指向 froggeric/Qwen-Fixed-Chat-Templates v22.5(`qwen3.8-froggeric-v22.5`,单文件
   覆盖 3.5/3.6/3.8,vision 内建)。默认思考档 xhigh→medium;修复工具调用/思考定界/

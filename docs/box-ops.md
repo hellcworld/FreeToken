@@ -27,7 +27,7 @@ PrismML **Ternary-Bonsai-2-27B**(Qwen3.8-27B 基底,~1.7bpw 三值 PQ2_0,整包 
 ExecStart=.../llama-server \
   -m .../models/bonsai2/Ternary-Bonsai-2-27B-Abliterated-v2-PQ2_0-MTP.gguf \
   --mmproj .../models/bonsai2/Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf   # 官方视觉投影,与 abliterated 主模型兼容
-  -ngl 999 -fa on -c 65536 -ctk q8_0 -ctv q8_0 \   # 全层进显存;64K 上下文;KV q8 量化(~1.5GB)
+  -ngl 999 -fa on -c 98304 -ctk q4_0 -ctv q4_0 \   # 全层进显存;96K 上下文;KV q4 量化(~1.1GB;2026-10-27 起,显存 11.8/12.3GB)
   --jinja --spec-type draft-mtp --spec-draft-n-max 2 \   # MTP 投机(2 草稿)
   --chat-template-file /home/adminuser/models/bonsai2/chat_template_froggeric_v22.5.jinja \  # froggeric 固化模板(见 1.5)
   --image-min-tokens 1024 --host 127.0.0.1 --port 8012 \
@@ -45,7 +45,7 @@ Environment=LD_LIBRARY_PATH=.../build133/bin       # 动态链接库
 
 | 指标 | 数值 |
 |---|---|
-| 冷加载 | 10-20s;显存 11.5-11.8 / 12.3GB |
+| 冷加载 | 10-20s;显存 11.8 / 12.3GB(96K q4 KV,2026-10-27 起;此前 64K q8 为 11.5-11.8) |
 | decode | 34-49 tok/s(短上下文);~39K ctx 降至 26-28(带宽瓶颈,预期行为);64K 满约 22-24 |
 | prefill | ~500 tok/s 且平坦(4K/16K 实测一致)——对比旧 ftserve 8K 即掉 116 |
 | MTP | 接受率 0.4-0.7 @temp1.0(贪心可到 0.92);关掉 MTP 会慢 ~40%,别关 |
@@ -53,7 +53,7 @@ Environment=LD_LIBRARY_PATH=.../build133/bin       # 动态链接库
 | **草稿深度 n-max** | **2 为最优**(2026-10-13 全矩阵对照:n=1 平均 ~37.7 t/s(接受率 0.52-0.59/步长 1.5-1.6),n=2 ~39.2(0.49-0.65/2.0-2.3),n=3 ~26.5,n=4 ~31.5;≥3 接受率崩到 0.21-0.35 纯浪费)——别调 |
 | **CPU 协同(-ngl 拆层)** | **有害,勿用**(2026-10-13 实测:-ngl 999 全 GPU ~33.9 t/s;63=2 层(~3% 权重)给 CPU → ~22.7(-33%);55=10 层(~15%)→ ~9.9(-71%,慢 3.4 倍)。R5 3600 双通道 DDR4 ~51GB/s 仅为显存 1/7,层间串行+PCIe 同步,拆多少亏多少。CPU 的正确角色:网关/系统/--cache-ram,不算模型) |
 | **SM 频率上限 1500MHz(现役,2026-10-13 起)** | `nvidia-smi -lgc 210,1500`(下限 210 保空闲降频)。实测:decode 完全无损(5083 tok 长跑 37.7 t/s),负载功耗 172→~85W、温度 78→67°C;**代价:prefill -12%**(433→381 t/s,36K 全新提示 83→94s,有前缀缓存时无感)。持久化三重保障:开机计划任务 `GPU-Clock-Cap`(SYSTEM/onstart)+ 看门狗 v2 复位后自动重申(驱动级复位会清锁)+ 手动。调整:`schtasks /change`+`nvidia-smi -lgc 210,XXXX`;撤销:`schtasks /delete /tn GPU-Clock-Cap /f && nvidia-smi -rgc`。另:显存 7501 档为纸面值(实测恒 7301),功耗墙 180W 无收益,均已还原 |
-| **KV q4_0** | **无收益不采用**(同日实测 @36K ctx:q8 均值 ~26.6 vs q4 26.9 t/s,差距被 MTP 接受率波动(±10%)淹没;理论收益 ~6% 兑现不了,还带长文召回质量风险。维持 q8_0) |
+| **KV q4_0** | 速度维度无收益(@36K 实测 26.9 vs 26.6 t/s,在 MTP 波动内);但**容量维度采用**(2026-10-27):96K 上下文靠 q4 才放得下(KV 1.1GB vs q8 的 2.25GB),与 hermes context_length=98304 联动(压缩触发 ~73.7K)。注意:hermes agent **无法**自行改 /etc/systemd 的 unit(工具策略拒绝敏感路径,需 sudo 批准)——运维改动走人工 |
 | 能力 | 视觉(读图准确)、工具调用(JSON 规范)、中文长文连贯 |
 
 ### 1.4 文件与常用操作
