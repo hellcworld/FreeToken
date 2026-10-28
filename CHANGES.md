@@ -624,6 +624,10 @@ llama-server 作为并行 LLM 后端,与 ftserve 互为备选。
   两次均 `systemctl --user restart hermes-gateway` 秒愈。兜底:linger 用户定时器
   `hermes-gateway-refresh.timer` 每日 04:05 预防性重启;诊断口诀见 box-ops §3.2
   (看 gateway.log 的 inbound 时间戳,别信 /api/status)。
+- **生图门禁三处接回(2026-10-28)**:发现 10-13~10-25 间三处协调改动(portproxy
+  8188→8191、Caddyfile :8189 上游→8191、webui.service --comfy→8191)使全部生图
+  路径绕过 gpu-gateway 的生图门禁(bonsai 醒时生图会 OOM,实测坐实)。全部接回
+  8188;功能实测:门禁自动停车 bonsai 后放行,198s 出图。
 - **思考预算 800→1600(2026-10-27)**:unit `--reasoning-budget 1600`(思考上限
   ~50s),中文重定向消息保留;等在途请求排空后重启,冒烟 4s 通过。
 - **96K 上下文 + q4 KV(2026-10-27)**:用户让 hermes 改配置但被其工具策略拦截
