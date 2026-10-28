@@ -624,6 +624,15 @@ llama-server 作为并行 LLM 后端,与 ftserve 互为备选。
   两次均 `systemctl --user restart hermes-gateway` 秒愈。兜底:linger 用户定时器
   `hermes-gateway-refresh.timer` 每日 04:05 预防性重启;诊断口诀见 box-ops §3.2
   (看 gateway.log 的 inbound 时间戳,别信 /api/status)。
+- **双向显存互斥补齐(2026-10-28,接上文)**:接回门禁后并发使用立刻暴露单向
+  保护缺口——生图进行中的 LLM 请求照样唤醒 bonsai,10-28 09:29 实录碰撞
+  (comfy 加载中被唤醒,bonsai "failed to fit" 崩溃循环,生图卡死 16 分钟,
+  269 请求堆积)。修复四件套(gpu_gateway.py):①comfy 队列非空时 LLM 唤醒
+  挂起(FT_VS_COMFY_CAP=300s 后 503);②LLM 唤醒前先 POST /free 清 ComfyUI
+  缓存显存;③兼容 ComfyUI ≥0.37 小写 queue_running/queue_pending 键(旧监视器
+  对此全盲——互斥首版失效的真因);④/prompt 后 30s 入队宽限期防监视器清零。
+  另 webui.py 提交超时 30→300s。验收:宽限窗口内并发 LLM 被正确挂起
+  ("comfy busy; holding LLM wake"),生图完成后堆积请求全放行,4s 正常应答。
 - **生图门禁三处接回(2026-10-28)**:发现 10-13~10-25 间三处协调改动(portproxy
   8188→8191、Caddyfile :8189 上游→8191、webui.service --comfy→8191)使全部生图
   路径绕过 gpu-gateway 的生图门禁(bonsai 醒时生图会 OOM,实测坐实)。全部接回

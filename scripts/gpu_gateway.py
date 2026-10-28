@@ -12,6 +12,9 @@ Rules (all timings via env, seconds):
   * The backend idles (no in-flight requests, no activity) for FT_IDLE -> stopped.
   * A ComfyUI /prompt submission waits for the backend to drain (COMFY_WAIT_CAP),
     then stops it before the job is let through.
+  * Mutual exclusion both ways: while ComfyUI's queue is busy the gateway REFUSES to
+    wake the LLM (FT_VS_COMFY_CAP wait, then 503) - waking 11GB onto a GPU that is
+    mid-generation OOMs both sides (2026-10-28 incident).
   * ComfyUI queue empty for COMFY_FREE_IDLE -> POST /free {"unload_all": true}.
 
 Stats are backend-agnostic: ftserve serves /v1/stats natively; llama-server is
@@ -41,6 +44,7 @@ FT_IDLE = float(os.environ.get("FT_IDLE", 600))
 COMFY_FREE_IDLE = float(os.environ.get("COMFY_FREE_IDLE", 300))
 COMFY_WAIT_CAP = float(os.environ.get("COMFY_WAIT_CAP", 600))
 FT_WAKE_CAP = float(os.environ.get("FT_WAKE_CAP", 300))
+FT_VS_COMFY_CAP = float(os.environ.get("FT_VS_COMFY_CAP", 300))
 GOV_TICK = float(os.environ.get("GOV_TICK", 30))
 QUEUE_POLL = float(os.environ.get("QUEUE_POLL", 5))
 
@@ -56,6 +60,9 @@ _state: dict = {
     "llm_model": None,  # llama-server /props model name, cached once per wake
     "comfy_last_active": time.time(),
     "comfy_freed": False,
+    "comfy_jobs": 0,       # ComfyUI queue depth (watcher-maintained); gates LLM wake
+    "comfy_prompt_at": 0.0,  # last /prompt forwarded at; grace vs watcher zeroing
+    "wake_fail_reason": None,
     "started": time.time(),
 }
 
@@ -147,6 +154,14 @@ async def _wake_ft() -> bool:
     """single-flight: start the LLM unit and wait until /health says ok."""
     _state["ft"] = "waking"
     _state["llm_model"] = None
+    # ComfyUI caches models in VRAM after jobs; without this the LLM load
+    # fails to fit and crash-loops until ComfyUI's own idle /free fires.
+    if _state["comfy_jobs"] == 0:
+        await asyncio.to_thread(
+            _http_json, f"http://127.0.0.1:{COMFY_UP[1]}/free", "POST",
+            b'{"unload_all": true}', 10.0,
+        )
+        await asyncio.sleep(3)
     log(f"waking {FT_UNIT} (systemctl start)")
     if not await _systemctl("start", FT_UNIT):
         _state["ft"] = "down"
@@ -171,6 +186,18 @@ async def _wake_ft() -> bool:
 
 async def ensure_ft() -> bool:
     """Make sure the LLM backend is serving; concurrent callers share one wake."""
+    # Never wake the LLM onto a GPU ComfyUI is using - wait for its queue to drain.
+    deadline = time.monotonic() + FT_VS_COMFY_CAP
+    while _state["comfy_jobs"] > 0 and time.monotonic() < deadline:
+        if time.time() - _state.get("hold_log_at", 0.0) > 30:
+            log(f"comfy busy ({_state['comfy_jobs']} in queue); holding LLM wake ({_state['ft_inflight']} req)")
+            _state["hold_log_at"] = time.time()
+        await asyncio.sleep(2)
+    if _state["comfy_jobs"] > 0:
+        _state["wake_fail_reason"] = f"GPU busy with ComfyUI jobs ({_state['comfy_jobs']} queued) for > {FT_VS_COMFY_CAP}s"
+        log(_state["wake_fail_reason"])
+        return False
+    _state["wake_fail_reason"] = None
     if _state["ft"] == "up" and await _ft_probe(ready_only=True) is not None:
         return True
     if _state["wake_task"] is None:
@@ -278,8 +305,8 @@ async def _handle_llm(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         _state["ft_inflight"] += 1
         try:
             if not await ensure_ft():
-                _reply(writer, "503 Service Unavailable",
-                       {"error": f"{FT_UNIT} wake failed or timed out (> {FT_WAKE_CAP}s); retry soon"})
+                reason = _state.get("wake_fail_reason") or f"{FT_UNIT} wake failed or timed out (> {FT_WAKE_CAP}s)"
+                _reply(writer, "503 Service Unavailable", {"error": f"{reason}; retry soon"})
                 await writer.drain()
                 writer.close()
                 return
@@ -310,6 +337,8 @@ async def _handle_comfy(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 await writer.drain()
                 writer.close()
                 return
+            _state["comfy_jobs"] = max(1, _state["comfy_jobs"])  # block LLM wake immediately
+            _state["comfy_prompt_at"] = time.time()
         await _tunnel(reader, writer, head, rest, COMFY_UP)
     except Exception as exc:  # noqa: BLE001
         log(f"comfy handler error: {exc!r}")
@@ -328,6 +357,7 @@ def _gateway_status() -> dict:
             "ft_idle_s": round(time.time() - _state["ft_last_active"], 1),
             "ft_idle_target_s": FT_IDLE,
             "comfy_freed": _state["comfy_freed"],
+            "comfy_jobs": _state["comfy_jobs"],
             "uptime_s": round(time.time() - _state["started"], 1),
         },
         "upstream_stats": _state["last_stats"],
@@ -374,7 +404,15 @@ async def _comfy_queue_watch() -> None:
             )
             if q is None:
                 continue
-            busy = len(q.get("QueueRunning") or []) + len(q.get("QueuePending") or [])
+            # ComfyUI >= 0.37 lowercased the /queue keys; accept both spellings.
+            running = q.get("QueueRunning") or q.get("queue_running") or []
+            pending = q.get("QueuePending") or q.get("queue_pending") or []
+            busy = len(running) + len(pending)
+            # Grace: a big graph takes seconds to parse before ComfyUI enqueues it;
+            # without this the watcher zeroes comfy_jobs in that gap and an LLM wake
+            # slips in between the gate's park and the job's registration.
+            grace = time.time() - _state.get("comfy_prompt_at", 0.0) < 30
+            _state["comfy_jobs"] = max(busy, 1 if grace else 0)
             if busy:
                 _state["comfy_last_active"] = time.time()
                 _state["comfy_freed"] = False

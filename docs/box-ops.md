@@ -116,6 +116,12 @@ ComfyUI UI/caddy  ──> :8188 网关 ──> ComfyUI :8191
 - **按需唤醒**:其余请求 single-flight 唤醒后端(systemctl start + 轮询 /health
   status=="ok"),请求扣住等待,就绪后原始字节透传(SSE/WS 天然支持);失败 503
 - **空闲停车**:无在途请求且空闲 > `FT_IDLE` → `systemctl stop` 后端,释放 ~11GB
+- **双向互斥(2026-10-28 补齐)**:生图队列非空时网关**拒绝唤醒 LLM**(等待
+  FT_VS_COMFY_CAP=300s 后 503);LLM 唤醒前先向 ComfyUI 发 /free 腾出缓存显存。
+  事故教训:①单向门禁下生图中途的 LLM 请求会把 bonsai 硬拉起来→双双 OOM
+  (10-28 09:29 实录:卡死 16 分钟);②ComfyUI ≥0.37 的 /queue 键改为小写
+  queue_running/queue_pending,旧监视器全盲;③大图解析入队有秒级窗口,需 30s
+  宽限期防止监视器清零。webui.py 的提交超时 30→300s 适配排空等待。
 - **生图门禁**:ComfyUI `POST /prompt` 先等 LLM 排空(网关在途 0 + 上游 active 0,
   上限 `COMFY_WAIT_CAP`)再停车放行;超时 503
 - **comfy 释放**:ComfyUI 队列空 > `COMFY_FREE_IDLE` → `POST /free unload_all`
