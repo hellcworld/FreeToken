@@ -183,8 +183,12 @@ ComfyUI UI/caddy  ──> :8188 网关 ──> ComfyUI :8191
 ### 3.3.1 Caddyfile 8187 块丢失事故(2026-10-28 修复)
 
 10-13 14:09 有人改过 /etc/caddy/Caddyfile(非本文档流程):删掉了 :8187(hermes
-basic_auth→9119)块,并把 :8189 上游从网关 8188 改为直连 ComfyUI 8191(绕过生图
-门禁——**保留**,视为有意调整;注意该路径生图不再自动停车 bonsai,双跑有 OOM 风险)。
+basic_auth→9119)块,并把 :8189 上游从网关 8188 改为直连 ComfyUI 8191。后续还有
+两处协调改动(portproxy 8188→8191、10-25 webui.service --comfy 8191),致全部生图
+路径绕过生图门禁(bonsai 醒时生图必 OOM)。**2026-10-28 三处全部接回**:
+portproxy 8188→8188、Caddyfile :8189 上游→8188、webui.service --comfy→8188;
+功能实测:bonsai 醒着时提交生图,网关日志 "parking bonsai for comfy job" →
+停车 → 放行 → 198s 出图 ✓。备份 *.bak-1028(b)。
 caddy 某次重启加载新配置后 8187 消失,局域网/公网 hermes 入口断。2026-10-28:
 恢复 :8187 块;发现旧 bcrypt 哈希与文档密码(hermes-box-9119)不匹配(疑似历史上
 轮换过),**已重置为文档值** hermes/hermes-box-9119。备份 Caddyfile.bak-1028。
