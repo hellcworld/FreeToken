@@ -180,6 +180,15 @@ ComfyUI UI/caddy  ──> :8188 网关 ──> ComfyUI :8191
 | dashboard.public_url | https://hermes.infrafixed.com | **必设为公网域名**:WS 一次性票据校验绑定此值,错配=聊天无限重连(已修) |
 | dashboard.basic_auth | admin / *(scrypt)* | 网页登录层 |
 
+### 3.3.1 Caddyfile 8187 块丢失事故(2026-10-28 修复)
+
+10-13 14:09 有人改过 /etc/caddy/Caddyfile(非本文档流程):删掉了 :8187(hermes
+basic_auth→9119)块,并把 :8189 上游从网关 8188 改为直连 ComfyUI 8191(绕过生图
+门禁——**保留**,视为有意调整;注意该路径生图不再自动停车 bonsai,双跑有 OOM 风险)。
+caddy 某次重启加载新配置后 8187 消失,局域网/公网 hermes 入口断。2026-10-28:
+恢复 :8187 块;发现旧 bcrypt 哈希与文档密码(hermes-box-9119)不匹配(疑似历史上
+轮换过),**已重置为文档值** hermes/hermes-box-9119。备份 Caddyfile.bak-1028。
+
 ### 3.4 公网链路
 
 ```
