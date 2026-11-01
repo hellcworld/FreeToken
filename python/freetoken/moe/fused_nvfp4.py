@@ -55,12 +55,38 @@ _DECODE_BLOCK_N = 64
 _DECODE_BLOCK_KB = 128
 _DECODE_WARPS = 4
 
-# Marlin-style decode config (int32 wide loads + deferred reduction). Offline sweep over
-# the qwen35/qwen3moe (I=512/768) decode shapes picked BLOCK_N=16, BLOCK_KW=16 (== 128
-# k-values/iter), 4 warps -- the wide load lifts the gate/up GEMM ~43%->~51% of peak BW.
+# Marlin-style decode config (int32 wide loads + deferred reduction + pair dequant).
+# Offline sweep over the qwen35/qwen3moe (I=512/768) decode shapes picked BLOCK_N=16,
+# BLOCK_KW=16 (== 128 k-values/iter), 4 warps -- the wide load lifts the gate/up GEMM
+# ~43%->~51% of peak BW.
 _DECODE_MARLIN_BLOCK_N = 16
 _DECODE_MARLIN_BLOCK_KW = 16
 _DECODE_MARLIN_WARPS = 4
+
+# K-major banks (nvfp4_t): N-contiguous weight tiles make wide BLOCK_N the winner
+# (the same sweep on the native layout had bn32 60% SLOWER than bn16). RTX 3060
+# sweep: bn64/kw32/w4 beats the native config on every decode shape (up to 1.8x on
+# the K=768 gemm2, 282-295 GB/s ~ 82% peak on the H=4096 shapes).
+_DECODE_MARLIN_KM_BLOCK_N = 64
+_DECODE_MARLIN_KM_BLOCK_KW = 32
+_DECODE_MARLIN_KM_WARPS = 4
+
+
+def _bank_geometry(packed: torch.Tensor, scale: torch.Tensor):
+    """Kernel geometry for either bank layout. Returns
+    ``(N, K, packed_i32, (pe, pn, pkw), (se, sn, sblk))`` with the stride tuples in
+    kernel-argument order.
+
+    Native: uint8 ``[S, N, K//2]`` + e4m3 ``[S, N, K//16]`` (ModelOpt rows).
+    K-major (``nvfp4_t``): int32 ``[S, K//8, N]`` + ``[S, K//16, N]`` from
+    ``nvfp4_fused_moe.nvfp4_transpose_bank`` -- N contiguous, strides swapped.
+    """
+    if packed.dtype == torch.int32:
+        (pe, pkw, pn) = packed.stride()
+        (se, sblk, sn) = scale.stride()
+        return packed.shape[2], packed.shape[1] * 8, packed, (pe, pn, pkw), (se, sn, sblk)
+    p32 = packed.view(torch.int32)
+    return packed.shape[1], packed.shape[2] * 2, p32, p32.stride(), scale.stride()
 
 
 def _tl_dtype(dt: torch.dtype):
@@ -85,6 +111,7 @@ def _decode_gemm(
     M, top_k = topk_ids.shape
     N = packed.shape[1]
     K = packed.shape[2] * 2
+    assert packed.dtype == torch.uint8, "LUT A/B baseline kernels read native-row banks only"
     scale = e4m3_kernel_view(scale)
     total_routes = M * top_k
     grid = (total_routes, triton.cdiv(N, _DECODE_BLOCK_N))
@@ -121,33 +148,35 @@ def _decode_gemm_marlin(
     a_row_is_route: bool,
 ) -> None:
     """Marlin-style decode GEMV: int32 wide loads + deferred reduction + arithmetic
-    pair dequant (:func:`_decode_nvfp4_marlin_kernel`). ``packed`` is the uint8
-    ``[S, N, K//2]`` bank; it is reinterpreted as int32 ``[S, N, K//8]`` (contiguous,
-    K%8==0 for NVFP4)."""
+    pair dequant (:func:`_decode_nvfp4_marlin_kernel`). Accepts either bank layout
+    (:func:`_bank_geometry`): native uint8 ``[S, N, K//2]`` banks (reinterpreted as
+    int32 ``[S, N, K//8]``, K%8==0 for NVFP4) or K-major ``nvfp4_t`` int32 banks."""
     M, top_k = topk_ids.shape
-    N = packed.shape[1]
-    K = packed.shape[2] * 2
-    packed_i32 = packed.view(torch.int32)  # [S, N, K // 8]
+    N, K, packed_i32, p_strides, s_strides = _bank_geometry(packed, scale)
+    kmajor = packed.dtype == torch.int32
+    block_n = _DECODE_MARLIN_KM_BLOCK_N if kmajor else _DECODE_MARLIN_BLOCK_N
+    block_kw = _DECODE_MARLIN_KM_BLOCK_KW if kmajor else _DECODE_MARLIN_BLOCK_KW
+    warps = _DECODE_MARLIN_KM_WARPS if kmajor else _DECODE_MARLIN_WARPS
     scale = e4m3_kernel_view(scale)
     total_routes = M * top_k
-    grid = (total_routes, triton.cdiv(N, _DECODE_MARLIN_BLOCK_N))
+    grid = (total_routes, triton.cdiv(N, block_n))
     _decode_nvfp4_marlin_kernel[grid](
         a, packed_i32, scale, glob, c, topk_weights, topk_ids,
         total_routes, N, K,
         a.stride(0), a.stride(1),
-        packed_i32.stride(0), packed_i32.stride(1), packed_i32.stride(2),
-        scale.stride(0), scale.stride(1), scale.stride(2),
+        *p_strides,
+        *s_strides,
         glob.stride(0), glob.stride(1),
         c.stride(0), c.stride(1), c.stride(2),
         topk_weights.stride(0), topk_weights.stride(1),
         topk_ids.stride(0), topk_ids.stride(1),
-        BLOCK_SIZE_N=_DECODE_MARLIN_BLOCK_N,
-        BLOCK_SIZE_KW=_DECODE_MARLIN_BLOCK_KW,
+        BLOCK_SIZE_N=block_n,
+        BLOCK_SIZE_KW=block_kw,
         TOP_K=top_k,
         A_ROW_IS_ROUTE=a_row_is_route,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         compute_type=_tl_dtype(c.dtype),
-        num_warps=_DECODE_MARLIN_WARPS,
+        num_warps=warps,
     )
 
 
@@ -172,7 +201,9 @@ def _fused_experts_decode_nvfp4(
     GEMV (:func:`_decode_gemm`), both with the same calling convention."""
     M, H = hidden_states.shape
     top_k = topk_ids.shape[1]
-    two_i = gate_up_packed.shape[1]
+    # gate_up N dim: [S, N, K//2] native rows vs [S, K//8, N] K-major banks
+    two_i = (gate_up_packed.shape[2] if gate_up_packed.dtype == torch.int32
+             else gate_up_packed.shape[1])
     inter = two_i // 2
     dev, dt = hidden_states.device, hidden_states.dtype
 
@@ -244,13 +275,20 @@ def fused_experts_decode_nvfp4_serial(
     )
 
 
-def _prefill_config(M: int) -> Dict[str, Any]:
+def _prefill_config(M: int, kmajor: bool = False) -> Dict[str, Any]:
     # ``BLOCK_SIZE_M`` is coupled to host-side ``moe_align_block_size`` (token padding),
     # so it cannot be picked by triton.autotune. Swept offline on the RTX 3060 (sm_86,
-    # the WSL verification box) over (BLOCK_M, BLOCK_N, BLOCK_KW, num_warps, num_stages)
-    # for the word-load kernel: bm16/bn64/kw16/w4/s4 anchors M<=64, bm32/bn128/kw16/w4/s4
-    # wins every M>=512 cell (both gemm shapes, both H) by 3-24%; kw32 and w8 always lose
-    # (kw32+bn128 exceeds smem). Threshold at 256 interpolates between the two anchors.
+    # the WSL verification box) over (BLOCK_M, BLOCK_N, BLOCK_KW, num_warps, num_stages).
+    # Native rows: bm16/bn64 anchors M<=64, bm32/bn64 won the interim sweep, bm32/bn128
+    # wins every M>=512 cell; kw32 and w8 always lose (kw32+bn128 exceeds smem).
+    # K-major banks: bn128 wins everywhere (1.46-2.04x over the native-best config) --
+    # N-contiguous tiles feed the dots 256-512B runs instead of 64B fragments.
+    if kmajor:
+        if M <= 256:
+            return dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=128, BLOCK_SIZE_KW=16,
+                        GROUP_SIZE_M=1, num_warps=4, num_stages=4)
+        return dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=128, BLOCK_SIZE_KW=16,
+                    GROUP_SIZE_M=8, num_warps=4, num_stages=4)
     if M <= 256:
         return dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=64, BLOCK_SIZE_KW=16,
                     GROUP_SIZE_M=1, num_warps=4, num_stages=4)
@@ -273,10 +311,8 @@ def _prefill_gemm(
     mul_routed_weight: bool,
     cfg: Dict[str, Any],
 ) -> None:
-    N = packed.shape[1]
-    K = packed.shape[2] * 2
+    N, K, packed_i32, p_strides, s_strides = _bank_geometry(packed, scale)
     EM = sorted_ids.shape[0]
-    packed_i32 = packed.view(torch.int32)  # [S, N, K // 8]
     scale = e4m3_kernel_view(scale)
     even_k = K % (cfg["BLOCK_SIZE_KW"] * 8) == 0
     grid = lambda META: (  # noqa: E731
@@ -287,8 +323,8 @@ def _prefill_gemm(
         num_tokens_post_padded,
         N, K, EM, num_valid_tokens,
         a.stride(0), a.stride(1),
-        packed_i32.stride(0), packed_i32.stride(1), packed_i32.stride(2),
-        scale.stride(0), scale.stride(1), scale.stride(2),
+        *p_strides,
+        *s_strides,
         glob.stride(0), glob.stride(1),
         c.stride(1), c.stride(2),
         topk_weights_flat.stride(0),
@@ -321,10 +357,12 @@ def fused_experts_nvfp4(
     materialized ``[:E]`` slot view or the overlap double buffer), raw ids."""
     M, H = hidden_states.shape
     top_k = topk_ids.shape[1]
-    two_i = gate_up_packed.shape[1]
+    # gate_up N dim: [S, N, K//2] native rows vs [S, K//8, N] K-major banks
+    two_i = (gate_up_packed.shape[2] if gate_up_packed.dtype == torch.int32
+             else gate_up_packed.shape[1])
     inter = two_i // 2
     dev, dt = hidden_states.device, hidden_states.dtype
-    cfg = _prefill_config(M)
+    cfg = _prefill_config(M, kmajor=gate_up_packed.dtype == torch.int32)
 
     sorted_ids, expert_ids, ntpp = moe_align_block_size(topk_ids, cfg["BLOCK_SIZE_M"], num_experts)
     tw = topk_weights.reshape(-1).contiguous()

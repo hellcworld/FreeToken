@@ -167,6 +167,7 @@ def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
         b12x_repack_sources_inplace,
         marlin_repack_layer,
         marlin_repack_sources_inplace,
+        nvfp4_t_repack_sources,
         select_nvfp4_backend,
     )
 
@@ -175,7 +176,9 @@ def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
     # "triton" backend) is written as-loaded straight through the sink. marlin/b12x repack
     # per expert: when converting (layer_sink given), a wrapper sink repacks each layer as
     # it completes and forwards the renamed banks to the outer sink; serving (no sink)
-    # repacks the whole materialized bank set in place after load.
+    # repacks the whole materialized bank set in place after load. triton-km also loads
+    # through the native sink and transposes the materialized banks afterward (one exact
+    # permutation per layer; the streamed sink itself stays layout-native).
     native = decode_target == "cpu"
     backend = None
     if not native:
@@ -185,11 +188,11 @@ def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
         native = backend == "triton"
 
     repack_sink = None
-    if not native and not dummy and layer_sink is not None:
+    if backend in ("marlin", "b12x") and not dummy and layer_sink is not None:
         repack_layer = {"marlin": marlin_repack_layer, "b12x": b12x_repack_layer}[backend]
         repack_sink = _Nvfp4RepackSink(repack_layer, model_config, device, layer_sink)
 
-    if native:
+    if native or backend == "triton-km":
         sink = None if dummy else layer_sink
     else:
         sink = repack_sink  # None for serving/dummy marlin/b12x; the repack wrapper when converting
@@ -212,6 +215,13 @@ def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
     logger.info(f"NVFP4 expert backend: {backend}")
     if backend == "triton":
         return ExpertBanks("nvfp4", {name: sources[name] for name in _BANK_SCHEMAS["nvfp4"]},
+                           streamed=sink is not None)
+    if backend == "triton-km":
+        # K-major word-transposed rows for the Triton kernels (exact permutation):
+        # N-contiguous weight tiles unlock wide BLOCK_N (decode bn64/kw32, prefill
+        # bn128 on the 3060 sweep). Loads stream natively; transpose runs after.
+        sources = nvfp4_t_repack_sources(sources, device)
+        return ExpertBanks("nvfp4_t", {name: sources[name] for name in _BANK_SCHEMAS["nvfp4_t"]},
                            streamed=sink is not None)
     quant_format = f"nvfp4_{backend}"
     if repack_sink is not None:

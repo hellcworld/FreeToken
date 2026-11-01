@@ -463,12 +463,15 @@ class OffloadMoELayer(MoELayer):
                 self.activation,
                 self.apply_router_weight_on_input,
             )
-        if fmt == "nvfp4":
-            # FreeToken's Triton inline-dequant kernels over the native ModelOpt
-            # rows: the FP4 banks are read directly in the GEMM, no BF16 copy of
-            # the experts is ever materialized. The swigluoai scalars (MiniMax-M3)
-            # live on the layer via make_moe_layer's extra_attrs (gpt-oss precedent)
-            # and are ignored by the plain *_and_mul activations.
+        if fmt in ("nvfp4", "nvfp4_t"):
+            # FreeToken's Triton inline-dequant kernels over the ModelOpt rows: the FP4
+            # banks are read directly in the GEMM, no BF16 copy of the experts is ever
+            # materialized. "nvfp4_t" is the K-major word-transposed variant of the same
+            # six banks (--nvfp4-backend triton-km; N-contiguous tiles, wide BLOCK_N) --
+            # the wrappers sniff the layout off packed.dtype, the kernels are identical.
+            # The swigluoai scalars (MiniMax-M3) live on the layer via make_moe_layer's
+            # extra_attrs (gpt-oss precedent) and are ignored by the plain *_and_mul
+            # activations.
             act_alpha = getattr(self, "hidden_act_alpha", 1.702)
             act_limit = getattr(self, "swiglu_limit", None)
             # None == "no clamp" everywhere else in the repo (mxfp4 maps it to +inf).

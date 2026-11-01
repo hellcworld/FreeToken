@@ -26,7 +26,8 @@ class EngineConfig:
     max_running_req: int = 4
     attention_backend: str = "auto"
     moe_backend: str = "auto"
-    # NVFP4 routed-expert GEMM backend (--nvfp4-backend): auto|marlin|flashinfer|triton.
+    # NVFP4 routed-expert GEMM backend (--nvfp4-backend):
+    # auto|marlin|flashinfer|triton|triton-km (K-major transposed Triton banks).
     nvfp4_backend: str = "triton"
     # Expert-bank host load (--expert-load): auto|serial|parallel. "auto" reads scattered
     # experts in parallel but falls back to serial when free RAM can't cover the banks + the

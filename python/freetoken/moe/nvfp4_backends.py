@@ -209,12 +209,21 @@ def select_nvfp4_backend(
     import importlib.util
 
     requested = (requested or "auto").strip().lower()
-    if requested not in ("auto", "marlin", "flashinfer", "triton"):
+    if requested not in ("auto", "marlin", "flashinfer", "triton", "triton-km"):
         raise ValueError(
-            f"bad --nvfp4-backend={requested!r}; expected auto, marlin, flashinfer or triton"
+            f"bad --nvfp4-backend={requested!r}; expected auto, marlin, flashinfer, "
+            "triton or triton-km"
         )
     if requested == "triton":
         return "triton"
+    if requested == "triton-km":
+        # K-major word-transposed banks for the Triton kernels (nvfp4_t layout): same
+        # kernels (they are stride-parameterized), N-contiguous weight tiles. Runs
+        # anywhere the native Triton path runs; needs a CUDA device for the load-time
+        # transpose (decode_target=cpu keeps the native rows regardless).
+        if device.type != "cuda":
+            raise RuntimeError("--nvfp4-backend=triton-km requires a CUDA device")
+        return "triton-km"
     if activation != "silu":
         if requested != "auto":
             raise RuntimeError(
@@ -445,6 +454,47 @@ def marlin_repack_sources_inplace(
         "gate_up_alpha": torch.cat(gate_up_alpha_layers),
         "down_alpha": torch.cat(down_alpha_layers),
     }
+
+
+# ---------------------------------------------------------------------------
+# K-major transpose for the Triton kernels (nvfp4_t layout, --nvfp4-backend triton-km)
+# ---------------------------------------------------------------------------
+
+
+def nvfp4_t_repack_sources(
+    sources: dict[str, list[torch.Tensor]],
+    device: torch.device,
+) -> dict[str, list[torch.Tensor]]:
+    """Transpose the native NVFP4 banks into the K-major Triton layout (``nvfp4_t``).
+
+    Per layer, ``gate_up/down_{packed,scale}`` become ``int32 [E, K//8, N]`` /
+    ``[E, K//16, N]`` (:func:`freetoken.kernel.triton.nvfp4_fused_moe.nvfp4_transpose_bank`
+    -- an exact permutation); the ``*_global`` banks pass through untouched. The
+    transpose runs on ``device`` (GPU) chunk-by-chunk per layer and lands back on the
+    host, re-pinned when the source was pinned. Loads stream through in the native
+    layout; this runs once over the materialized per-layer lists.
+    """
+    from freetoken.kernel.triton.nvfp4_fused_moe import nvfp4_transpose_bank
+
+    on_gpu = device.type == "cuda"
+    num_layers = len(sources["gate_up_packed"])
+    for layer in range(num_layers):
+        for packed_name, scale_name in (
+            ("gate_up_packed", "gate_up_scale"),
+            ("down_packed", "down_scale"),
+        ):
+            packed, scale = sources[packed_name][layer], sources[scale_name][layer]
+            pinned = packed.is_pinned()
+            if on_gpu:
+                packed, scale = packed.to(device), scale.to(device)
+            packed_t, scale_t = nvfp4_transpose_bank(packed, scale)
+            if on_gpu:
+                packed_t, scale_t = packed_t.to("cpu"), scale_t.to("cpu")
+            if pinned:
+                packed_t, scale_t = packed_t.pin_memory(), scale_t.pin_memory()
+            sources[packed_name][layer] = packed_t
+            sources[scale_name][layer] = scale_t
+    return sources
 
 
 # ---------------------------------------------------------------------------

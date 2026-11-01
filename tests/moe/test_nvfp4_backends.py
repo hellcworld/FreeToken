@@ -411,6 +411,103 @@ def test_triton_decode_marlin_matches_baseline_kernel():
     torch.testing.assert_close(marlin.float(), base.float(), rtol=2e-3, atol=2e-3)
 
 
+@cuda
+def test_triton_km_banks_match_dequant_reference():
+    """The K-major word-transposed banks (nvfp4_t, --nvfp4-backend triton-km) through
+    the same Triton entry points: full-layer prefill with raw routing ids, then decode
+    through the slot cache with a cross-layer miss. The transpose is an exact
+    permutation, so the native sources double as the dequant reference."""
+    from freetoken.moe.fused_nvfp4 import (
+        fused_experts_decode_nvfp4_marlin,
+        fused_experts_nvfp4,
+    )
+    from freetoken.moe.nvfp4_backends import (
+        nvfp4_t_repack_sources,
+        select_nvfp4_backend,
+    )
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    device = torch.device("cuda")
+    assert select_nvfp4_backend(device, 768, "triton-km") == "triton-km"
+
+    native = _make_native_sources(device, seed=21)
+    km = nvfp4_t_repack_sources({name: list(t) for name, t in native.items()}, device)
+    assert km["gate_up_packed"][0].dtype == torch.int32
+    assert km["gate_up_packed"][0].shape == (E, H // 8, 2 * I)
+    assert km["gate_up_scale"][0].shape == (E, H // 16, 2 * I)
+    assert km["gate_up_global"][0].shape == native["gate_up_global"][0].shape
+
+    cache = OffloadMoeCache(
+        num_layers=L, num_experts=E, cache_size=S,
+        device=device, quant_format="nvfp4_t",
+    )
+    cache.set_bank_sources({name: km[name] for name in cache.bank_schema})
+    cache.reset()
+    torch.manual_seed(22)
+    M = 4
+    hidden = torch.randn(M, H, dtype=torch.bfloat16, device=device) / 4
+    topk_ids = torch.randint(0, E, (M, TOPK), dtype=torch.int32, device=device)
+    topk_weights = torch.rand(M, TOPK, dtype=torch.float32, device=device)
+
+    cache.materialize_layer(0)
+    cache.copy_missing()
+    gu_p, gu_s, gu_g, dn_p, dn_s, dn_g = cache.bank_views(E)
+    ref = _ref_moe(native, 0, hidden, topk_weights, topk_ids)
+    out = fused_experts_nvfp4(
+        hidden, gu_p, gu_s, gu_g, dn_p, dn_s, dn_g,
+        topk_weights, topk_ids, E, "silu", False,
+    )
+    _assert_close(out, ref)
+
+    dec_hidden, dec_ids, dec_weights = hidden[:1], topk_ids[:1], topk_weights[:1]
+    ref = _ref_moe(native, 0, dec_hidden, dec_weights, dec_ids)
+    cache.materialize_layer(1)  # stomp every slot with layer-1 experts (S == E)
+    cache.copy_missing()
+    cache.ensure_experts(0, dec_ids)  # layer-0 experts now miss + reload
+    cache.copy_missing()
+    banks = cache.bank_views()
+    out = fused_experts_decode_nvfp4_marlin(
+        dec_hidden, *banks, dec_weights, dec_ids, "silu", False
+    )
+    _assert_close(out, ref)
+
+
+@cuda
+def test_triton_km_matches_native_layout():
+    """Same sources, both layouts: the K-major path must agree with the native-row path
+    within kernel-ordering tolerance (different tile configs reorder the reduction)."""
+    from freetoken.moe.fused_nvfp4 import (
+        fused_experts_decode_nvfp4_marlin,
+        fused_experts_nvfp4,
+    )
+    from freetoken.moe.nvfp4_backends import nvfp4_t_repack_sources
+
+    device = torch.device("cuda")
+    native = _make_native_sources(device, seed=23)
+    km = nvfp4_t_repack_sources({name: list(t) for name, t in native.items()}, device)
+    torch.manual_seed(24)
+    M = 2
+    hidden = torch.randn(M, H, dtype=torch.bfloat16, device=device) / 4
+    topk_ids = torch.randint(0, E, (M, TOPK), dtype=torch.int32, device=device)
+    topk_weights = torch.rand(M, TOPK, dtype=torch.float32, device=device)
+    layer = 0
+    order = (
+        "gate_up_packed", "gate_up_scale", "gate_up_global",
+        "down_packed", "down_scale", "down_global",
+    )
+    banks_native = [native[name][layer].to(device) for name in order]
+    banks_km = [km[name][layer].to(device) for name in order]
+
+    out_native = fused_experts_nvfp4(hidden, *banks_native, topk_weights, topk_ids, E, "silu", False)
+    out_km = fused_experts_nvfp4(hidden, *banks_km, topk_weights, topk_ids, E, "silu", False)
+    torch.testing.assert_close(out_km.float(), out_native.float(), rtol=2e-3, atol=2e-3)
+
+    dec_h, dec_ids, dec_w = hidden[:1], topk_ids[:1], topk_weights[:1]
+    out_native = fused_experts_decode_nvfp4_marlin(dec_h, *banks_native, dec_w, dec_ids, "silu", False)
+    out_km = fused_experts_decode_nvfp4_marlin(dec_h, *banks_km, dec_w, dec_ids, "silu", False)
+    torch.testing.assert_close(out_km.float(), out_native.float(), rtol=2e-3, atol=2e-3)
+
+
 def test_nvfp4_backend_selection():
     """--nvfp4-backend selection + the flashinfer/marlin device gates -- runs without a GPU
     via the CPU branch (forced backends need a usable device, so they error loudly there)."""
@@ -423,6 +520,8 @@ def test_nvfp4_backend_selection():
         select_nvfp4_backend(cpu, None, "flashinfer")  # b12x needs a CUDA device
     with pytest.raises(RuntimeError):
         select_nvfp4_backend(cpu, None, "marlin")  # marlin needs a CUDA device
+    with pytest.raises(RuntimeError):
+        select_nvfp4_backend(cpu, None, "triton-km")  # load-time transpose needs CUDA
     with pytest.raises(ValueError):
         select_nvfp4_backend(cpu, None, "bogus")
 

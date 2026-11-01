@@ -56,6 +56,19 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
         "down_scale",
         "down_global",
     ),
+    # K-major word-transposed rows for the same Triton kernels (--nvfp4-backend
+    # triton-km): same six banks and byte totals, but packed is int32 [L*E, K//8, N]
+    # and scale [L*E, K//16, N] (nvfp4_fused_moe.nvfp4_transpose_bank -- N contiguous,
+    # an exact permutation). Unlocks wide BLOCK_N tiles; the kernels themselves are
+    # unchanged (stride-parameterized), the wrappers sniff the layout off packed.dtype.
+    "nvfp4_t": (
+        "gate_up_packed",
+        "gate_up_scale",
+        "gate_up_global",
+        "down_packed",
+        "down_scale",
+        "down_global",
+    ),
     # pre-tiled layouts for the borrowed kernels; the globals are folded into the
     # block scales at repack time and collapse to [L*E] GPU-resident alpha vectors
     # (set_alphas), so they are not banks

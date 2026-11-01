@@ -86,17 +86,18 @@ def expert_bank_row_bytes(fmt: str, hidden_size: int, moe_intermediate_size: int
     if fmt == "q4_0":
         # gemma4/gguf.py _q4_0_expert_specs: GGML Q4_0 rows, 32 elems -> 18 bytes
         return {"gate_up": 2 * I * (H // 32 * 18), "down": H * (I // 32 * 18)}
-    if fmt in ("nvfp4", "nvfp4_marlin", "nvfp4_b12x"):
+    if fmt in ("nvfp4", "nvfp4_t", "nvfp4_marlin", "nvfp4_b12x"):
         # models/nvfp4_banks.py: packed e2m1 pairs + per-16 fp8-e4m3 scales + fp16
-        # per-row globals; marlin/b12x repacks are byte-identical with the globals
-        # folded into GPU-resident alphas (moe/nvfp4_backends.py), so no global banks.
+        # per-row globals; nvfp4_t word-transposes packed/scale in place (same byte
+        # totals); marlin/b12x repacks are byte-identical with the globals folded
+        # into GPU-resident alphas (moe/nvfp4_backends.py), so no global banks.
         banks = {
             "gate_up_packed": 2 * I * (H // 2),
             "gate_up_scale": 2 * I * (H // 16),
             "down_packed": H * (I // 2),
             "down_scale": H * (I // 16),
         }
-        if fmt == "nvfp4":
+        if fmt in ("nvfp4", "nvfp4_t"):
             banks["gate_up_global"] = 2 * I * 2
             banks["down_global"] = H * 2
         return banks
@@ -121,7 +122,7 @@ def expert_bank_row_bytes(fmt: str, hidden_size: int, moe_intermediate_size: int
     raise ValueError(f"Unknown expert bank format {fmt!r}")
 
 
-_NVFP4_FORMATS = ("nvfp4", "nvfp4_marlin", "nvfp4_b12x")
+_NVFP4_FORMATS = ("nvfp4", "nvfp4_t", "nvfp4_marlin", "nvfp4_b12x")
 
 # Config fields come from each checkpoint's config.json (text_config for the
 # multimodal wrappers); checkpoints without a local copy were recorded from

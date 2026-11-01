@@ -493,10 +493,30 @@ def _prefill_nvfp4_moe_kernel(
     tl.store(c_ptrs, acc.to(compute_type), mask=c_mask)
 
 
+def nvfp4_transpose_bank(
+    packed: torch.Tensor, scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Native rows -> K-major resident layout: ``[S, N, K//2]`` uint8 +
+    ``[S, N, K//16]`` e4m3 -> int32 ``[S, K//8, N]`` + ``[S, K//16, N]``.
+
+    Same word-exact construction as ``nvfp4_linear.nvfp4_transpose_resident``, batched
+    over slots: the int32 *words* move atomically (a byte-level ``.t()`` would scatter
+    each word's 4 bytes across the N axis). An exact permutation -- dequantized values
+    are bit-identical; only the strides the kernels see change (N contiguous), which
+    unlocks wide BLOCK_N tiles (native rows made bn32 60% slower; K-major bn64/kw32
+    wins every decode shape and bn128 doubles prefill on RTX 3060).
+    """
+    return (
+        packed.view(torch.int32).permute(0, 2, 1).contiguous(),
+        scale.permute(0, 2, 1).contiguous(),
+    )
+
+
 __all__ = [
     "_decode_nvfp4_moe_kernel",
     "_decode_nvfp4_marlin_kernel",
     "_prefill_nvfp4_moe_kernel",
     "_prefill_nvfp4_moe_kernel_lut",
     "_e2m1_lut",
+    "nvfp4_transpose_bank",
 ]
