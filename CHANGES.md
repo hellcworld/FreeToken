@@ -10,6 +10,7 @@
 | `89d2189` | **Qwen3.5/3.6/3.8 视觉输入**(对齐 gemma4 的支持级别) |
 | `98739bd`+ | **GPU 分时网关 + 盒子运行栈**(九~十一章,见下) |
 | `236fdb6` | **NVFP4 MoE 算子提速**(decode pair 位技巧 + prefill word 加载,见十二) |
+| 见十三 | **NVFP4 MoE K-major 布局**(`85a6f13`,`--nvfp4-backend triton-km`,prefill 再 1.4~2.0x) |
 
 ## 〇、当前运行栈速览(2026-10-10)
 
@@ -716,6 +717,34 @@ fp32 反量化参考 rtol 3e-2、新 decode 对旧基线核 rtol 2e-3 双护栏)
 `diagnostics/bench_nvfp4_moe_ab.py`(轮转交错防噪声)。盒子 comfy_venv 的
 site-packages 安装未动(该机 FreeToken 仅作验证机,非生产路径;下次
 `pip install` 自然生效)。
+
+## 十三、NVFP4 MoE K-major 布局(triton-km 后端,2026-11-01)
+
+dense 侧 `nvfp4_transpose_resident` 的杠杆移植到 MoE:expert bank 加载期做
+word 级转置(`packed.view(int32).permute(0,2,1)`),N 方向变连续。**四个 Triton
+核零改动**(全部 stride 参数化,wrapper 按 `packed.dtype` 嗅探布局),
+3060 实测(假设检验先行:bench 侧直接构造转置 bank 扫参,数据达标后才接线):
+
+| 路径 | 配置 | 相对提升 |
+|---|---|---|
+| decode(4 形状全胜) | bn64/kw32/w4 | 1.05~**1.82x**,大形状 282~295 GB/s(~82% 峰值) |
+| prefill M=8~64 | bm16/**bn128**/kw16/w4/s4 | 1.54~**2.04x** |
+| prefill M=512~2048 | bm32/**bn128**/同上 | 1.43~**1.86x** |
+
+叠加第十二章(相对最初 byte-LUT 基线):prefill 累计 **~5x**,decode 累计 ~1.6x。
+
+**接入面**:`--nvfp4-backend triton-km`(auto 不变,显式选择);新 quant_format
+`nvfp4_t`(与 `nvfp4` 同六个 bank,byte 总量相同;`mxfp4_triton` 先例的 N-innermost
+思路);`nvfp4_t_repack_sources` 在加载流后逐层 GPU 转置(CPU 解码路径保持原生行
+布局不受影响);aot_models 声明表补 `nvfp4_t`。LUT 基线核仅限原生布局(断言)。
+
+**验证**:盒子 3060 全套 `tests/moe + tests/kernels` 301 passed(新增
+`test_triton_km_banks_match_dequant_reference` 与
+`test_triton_km_matches_native_layout`,含 prefill/decode/跨层 miss/布局等价
+rtol 2e-3);`test_cpu_moe_q4_0` 1 例失败经 git stash 复测确认为**盒子既有问题**
+(基线同样失败,与本次无关)。修复过程中踩过两个坑:decode 共享体的
+`two_i = shape[1]` 在 KM 下取到 K//8(激活张量错位,已修);测试自身引用层与
+cache 加载层不一致(照 stomp 模式重写)。
 
 ## 版本说明 / Versioning
 
