@@ -9,6 +9,7 @@
 | `f1535a1` | **Qwen3.8-27B NVFP4 双方言支持**(修复 #139 一类加载崩溃) |
 | `89d2189` | **Qwen3.5/3.6/3.8 视觉输入**(对齐 gemma4 的支持级别) |
 | `98739bd`+ | **GPU 分时网关 + 盒子运行栈**(九~十一章,见下) |
+| `236fdb6` | **NVFP4 MoE 算子提速**(decode pair 位技巧 + prefill word 加载,见十二) |
 
 ## 〇、当前运行栈速览(2026-10-10)
 
@@ -673,6 +674,48 @@ llama-server 作为并行 LLM 后端,与 ftserve 互为备选。
   OpenAI-compat 后端不下发 reasoning_effort,只能服务端设)——budget=50 强制性
   验证思考被斩停在正中预算,正文照常输出;实测文案/数学 12~54s。回滚备份
   `bonsai.service.bak-reasoning`。
+
+## 十二、NVFP4 MoE 算子提速:pair 位技巧 + word 加载(2026-11-01)
+
+把 dense W4A16 线性层(`nvfp4_linear.py`)已验证的两项技术移植到 MoE 侧的两个
+Triton 算子,RTX 3060(sm_86,走 e4m3 仿真分支)实机验证:
+
+**decode GEMV(`_decode_nvfp4_marlin_kernel`)**——去掉每 word 8 次 L1 LUT gather,
+换 fp16-subnormal 位技巧反量化(`_nvfp4_pair_f32`,~5 条整数指令/对,block scale
+×16384 折入一次 fp32 乘法,数学上 bit-identical)。实测(3 轮交错复测取稳定值,
+排除 WSL 调度噪声):
+
+| 形状(qwen 系) | marlin-LUT | marlin-pair | 提速 | 有效带宽 |
+|---|---|---|---|---|
+| gemm1 H=4096 I=1024 | 198.2 us | 132.8 us | **1.49x** | 284 GB/s(79% 峰值) |
+| gemm2 H=4096 I=1024 | 101.6 us | 67.0 us | **1.52x** | 282 GB/s |
+| gemm1/gemm2 H=2048(两种 I) | - | - | 1.1~1.2x | 小形状延迟主导 |
+| H=2048 I=768 gemm1 | 80.0 us | 82.0 us | ~持平 | 无回归 |
+
+**prefill grouped GEMM(`_prefill_nvfp4_moe_kernel`,整体重写)**——旧核(byte 级
+加载 + LUT gather + 每 byte-tile 两次 dot + 激活 stride-2 双加载)换为:int32
+word 加载、fp16 pair 反量化(`s128` 折叠、epilogue `g×2^7` 还原)、交换操作数
+tensor-core dot(反量化权重直接作 lhs,不过共享内存)、激活整块连续加载 +
+`_split8_rows` 寄存器重排。旧核保留为 `_prefill_nvfp4_moe_kernel_lut`(A/B 基线,
+与 decode 侧惯例一致)。实测(数值差 ≤3.4e-3 相对,bf16 舍入量级):
+
+| 形状 | 旧核 | 新核 | 提速 |
+|---|---|---|---|
+| M=8/64(小批) | - | - | **2.66~3.03x** |
+| M=512(各种 H/I) | - | - | 2.11~2.41x(配置扫后最优) |
+| M=2048(各种 H/I) | - | - | 2.19~2.53x(配置扫后最优) |
+
+**配置重扫(3060,旧常数是 MiniMax-M2 形状在别的卡上扫的)**:
+`_prefill_config` 定稿 M≤256 用 bm16/bn64/kw16/w4/s4,M>256 用
+**bm32/bn128**/kw16/w4/s4(M≥512 全部 8 个矩阵单元胜出 3-24%;kw32+bn128 超
+smem)。decode 维持 bn16/kw16/w4(8 配置扫最优;bn32/kw32/w8 名义快 2.5% 但
+跨形状方差大,弃)。
+
+验证:`tests/moe/test_nvfp4_backends.py` 全绿(6 passed ×2 轮,含新 prefill 对
+fp32 反量化参考 rtol 3e-2、新 decode 对旧基线核 rtol 2e-3 双护栏);基准脚本
+`diagnostics/bench_nvfp4_moe_ab.py`(轮转交错防噪声)。盒子 comfy_venv 的
+site-packages 安装未动(该机 FreeToken 仅作验证机,非生产路径;下次
+`pip install` 自然生效)。
 
 ## 版本说明 / Versioning
 
