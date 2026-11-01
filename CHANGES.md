@@ -746,6 +746,38 @@ rtol 2e-3);`test_cpu_moe_q4_0` 1 例失败经 git stash 复测确认为**盒子�
 `two_i = shape[1]` 在 KM 下取到 K//8(激活张量错位,已修);测试自身引用层与
 cache 加载层不一致(照 stomp 模式重写)。
 
+## 十四、hermes 后端切换 FreeToken + 哨兵修复(2026-11-01)
+
+**版本哨兵误报根因**:`wsl --version` 输出 UTF-16,经 GBK 控制台解码后字符间残留
+NUL 字节——PowerShell 的 `\s` **不匹配 NUL**,导致 `-replace '\s',''` 归一化失效,
+哨兵自上线起每 10 分钟误报一次"版本漂移"。修复:归一化改为 `[^\x20-\x7E]`(仅保留
+可打印 ASCII),手动触发任务两次验证静默;仓库副本 diagnostics/wsl_keepalive.ps1
+同步(备份 keepalive.ps1.bak-sentinel)。
+
+**后端切换(bonsai → FreeToken)**:hermes 的 LLM 后端从 llama-server 切到本 fork:
+- `gpu-gateway.service`:`FT_UNIT=ftserve FT_UP_PORT=8011`,FT_WAKE_CAP 300→480
+  (K-major 加载期转置留余量);备份 `.bak-ftS`
+- `.freetoken/venv` 重装 freetoken @`72e7d96`(ensurepip 引导 + `--no-deps
+  --no-build-isolation`;uv venv 无 pip),上午两批新算子(pair 位技巧 + K-major)
+  进入服务路径;`/etc/default/ftserve` 追加 `--nvfp4-backend triton-km`(备份
+  `.bak-km`)
+- hermes `config.yaml` default 模型 → `Qwen3.6-35B-A3B-NVFP4-Fast`(备份
+  `.bak-ftswitch`);vision 引擎侧开启(FREETOKEN_LOAD_VISION=1 + pillow/torchvision
+  在位,图像端到端未单独测)
+- 过程坑:`server/args.py` 的 `--nvfp4-backend` choices 白名单漏了 triton-km,
+  ftserve 崩溃循环(argparse exit 2)——修复提交 `c367f2e`,顺带暴露了接线时漏掉
+  CLI 校验点
+- 实测:冷加载 ~100s(含逐层 K-major 转置);稳态 decode **25.5 tok/s**(引擎
+  `gen throughput` 日志,与 §5.5 的 27 tok/s 持平——单流 decode 上限是 expert
+  跨 PCIe 流式加载/缓存命中,不是 GPU 核;新算子的收益在 prefill 与缓存驻留层);
+  网关双向互斥正常(ftserve 唤醒时 ComfyUI 被 /free)
+- **回滚**:`cp gpu-gateway.service.bak-ftTS && systemctl daemon-reload &&
+  systemctl restart gpu-gateway` + hermes default 改回 bonsai2-27b-abliterated
+  + `cp /etc/default/ftserve.bak-km`;bonsai 单元保留未动(disabled)
+
+另:当日 09:56-09:57 曾有一次人工节奏的整栈停机(gateway→comfy→hermes-dashboard,
+非崩溃;WSL 未重启),本次切换时已全部拉起。
+
 ## 版本说明 / Versioning
 
 - 本 fork 标签:**`qwen38-vision-v1.0.0`**(见 git tag)
