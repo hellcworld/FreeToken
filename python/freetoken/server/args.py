@@ -551,11 +551,13 @@ def parse_args(
     parser.add_argument(
         "--nvfp4-backend",
         default=ServerArgs.nvfp4_backend,
-        choices=["auto", "marlin", "flashinfer", "triton"],
+        choices=["auto", "marlin", "flashinfer", "triton", "triton-km"],
         help=(
             "NVFP4 routed-expert GEMM backend (default: triton, the portable inline-dequant "
             "kernel). auto picks by GPU (marlin on sm80-99 + vLLM; flashinfer b12x on sm120+ "
-            "& CUDA>=13; else triton). Force one to override; it fails loudly if it cannot run."
+            "& CUDA>=13; else triton). Force one to override; it fails loudly if it cannot "
+            "run. triton-km loads the same Triton kernels over K-major word-transposed "
+            "banks (N-contiguous weight tiles; wide BLOCK_N on the 3060 sweep)."
         ),
     )
 
