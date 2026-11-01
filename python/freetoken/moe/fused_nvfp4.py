@@ -120,9 +120,10 @@ def _decode_gemm_marlin(
     mul_routed_weight: bool,
     a_row_is_route: bool,
 ) -> None:
-    """Marlin-style decode GEMV: int32 wide loads + deferred reduction
-    (:func:`_decode_nvfp4_marlin_kernel`). ``packed`` is the uint8 ``[S, N, K//2]`` bank;
-    it is reinterpreted as int32 ``[S, N, K//8]`` (contiguous, K%8==0 for NVFP4)."""
+    """Marlin-style decode GEMV: int32 wide loads + deferred reduction + arithmetic
+    pair dequant (:func:`_decode_nvfp4_marlin_kernel`). ``packed`` is the uint8
+    ``[S, N, K//2]`` bank; it is reinterpreted as int32 ``[S, N, K//8]`` (contiguous,
+    K%8==0 for NVFP4)."""
     M, top_k = topk_ids.shape
     N = packed.shape[1]
     K = packed.shape[2] * 2
@@ -132,7 +133,6 @@ def _decode_gemm_marlin(
     grid = (total_routes, triton.cdiv(N, _DECODE_MARLIN_BLOCK_N))
     _decode_nvfp4_marlin_kernel[grid](
         a, packed_i32, scale, glob, c, topk_weights, topk_ids,
-        _e2m1_lut(a.device.index),
         total_routes, N, K,
         a.stride(0), a.stride(1),
         packed_i32.stride(0), packed_i32.stride(1), packed_i32.stride(2),
@@ -244,15 +244,18 @@ def fused_experts_decode_nvfp4_serial(
     )
 
 
-def _prefill_config(M: int) -> Dict[str, int]:
+def _prefill_config(M: int) -> Dict[str, Any]:
     # ``BLOCK_SIZE_M`` is coupled to host-side ``moe_align_block_size`` (token padding),
-    # so it cannot be picked by triton.autotune; these were chosen by an offline sweep
-    # over (BLOCK_M, BLOCK_N, BLOCK_KB, num_warps, num_stages) for the MiniMax-M2 shapes.
-    if M <= 64:
-        return dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32,
-                    GROUP_SIZE_M=1, num_warps=8, num_stages=4)
-    return dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32,
-                GROUP_SIZE_M=8, num_warps=8, num_stages=4)
+    # so it cannot be picked by triton.autotune. Swept offline on the RTX 3060 (sm_86,
+    # the WSL verification box) over (BLOCK_M, BLOCK_N, BLOCK_KW, num_warps, num_stages)
+    # for the word-load kernel: bm16/bn64/kw16/w4/s4 anchors M<=64, bm32/bn128/kw16/w4/s4
+    # wins every M>=512 cell (both gemm shapes, both H) by 3-24%; kw32 and w8 always lose
+    # (kw32+bn128 exceeds smem). Threshold at 256 interpolates between the two anchors.
+    if M <= 256:
+        return dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=64, BLOCK_SIZE_KW=16,
+                    GROUP_SIZE_M=1, num_warps=4, num_stages=4)
+    return dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=128, BLOCK_SIZE_KW=16,
+                GROUP_SIZE_M=8, num_warps=4, num_stages=4)
 
 
 def _prefill_gemm(
@@ -273,17 +276,18 @@ def _prefill_gemm(
     N = packed.shape[1]
     K = packed.shape[2] * 2
     EM = sorted_ids.shape[0]
+    packed_i32 = packed.view(torch.int32)  # [S, N, K // 8]
     scale = e4m3_kernel_view(scale)
+    even_k = K % (cfg["BLOCK_SIZE_KW"] * 8) == 0
     grid = lambda META: (  # noqa: E731
         triton.cdiv(EM, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
     _prefill_nvfp4_moe_kernel[grid](
-        a, packed, scale, glob, c, topk_weights_flat, sorted_ids, expert_ids,
+        a, packed_i32, scale, glob, c, topk_weights_flat, sorted_ids, expert_ids,
         num_tokens_post_padded,
-        _e2m1_lut(a.device.index),
         N, K, EM, num_valid_tokens,
         a.stride(0), a.stride(1),
-        packed.stride(0), packed.stride(1), packed.stride(2),
+        packed_i32.stride(0), packed_i32.stride(1), packed_i32.stride(2),
         scale.stride(0), scale.stride(1), scale.stride(2),
         glob.stride(0), glob.stride(1),
         c.stride(1), c.stride(2),
@@ -291,6 +295,7 @@ def _prefill_gemm(
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         top_k=kernel_top_k,
         compute_type=_tl_dtype(c.dtype),
+        EVEN_K=even_k,
         **cfg,
     )
 
