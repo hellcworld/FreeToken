@@ -11,6 +11,7 @@
 | `98739bd`+ | **GPU 分时网关 + 盒子运行栈**(九~十一章,见下) |
 | `236fdb6` | **NVFP4 MoE 算子提速**(decode pair 位技巧 + prefill word 加载,见十二) |
 | 见十三 | **NVFP4 MoE K-major 布局**(`85a6f13`,`--nvfp4-backend triton-km`,prefill 再 1.4~2.0x) |
+| 见十五 | **SenseNova-Loop-9B 移植**(循环执行 + mHC 双流 + modelopt 注意力 FP4 直通) |
 
 ## 〇、当前运行栈速览(2026-10-10)
 
@@ -777,6 +778,66 @@ NUL 字节——PowerShell 的 `\s` **不匹配 NUL**,导致 `-replace '\s',''` 
 
 另:当日 09:56-09:57 曾有一次人工节奏的整栈停机(gateway→comfy→hermes-dashboard,
 非崩溃;WSL 未重启),本次切换时已全部拉起。
+
+## 十五、SenseNova-Loop-9B 移植:循环执行 + mHC 双流残差(2026-11-03)
+
+商汤 2026-10-30 开源的 SenseNova-Loop-9B-Preview(Apache-2.0,looped Transformer:
+32 层权重、层 4–28 循环执行两遍 = 56 次层计算;Qwen3.5 血统混合 GDN + full
+attention,text/vision 超参与 Qwen3.6-35B 同族)。本 fork 原生支持其文本侧,
+端到端实测在 RTX 3060 12GB 上加载社区 NVFP4 量化版(gitcommit90,ModelOpt
+校准,9.38GB)并生成。
+
+**移植设计(核心三件)**:
+- **虚拟层号重编号**:执行计划 `range(start) + range(start,end)×count +
+  range(end,n)`——visit-1 沿用物理层号,后续 visit 用
+  `num_layers + (visit-1)*span + (i-start)`(35..55)。attention groups 直接装
+  虚拟层号,KV 池与 GDN 状态池自动按组分配 → **每个 visit 独立 cache 槽**
+  (full-attn KV 槽 8→14,线性状态行 24→42),零池侧代码;仅池层数校验范围
+  改读 `num_virtual_layers`。层对象共享,forward 每 visit 前设置 mixer 的
+  `layer_id` 为虚拟槽号(解码 CUDA graph 捕获时按 visit 固化)
+- **mHC 双流残差**(`models/qwen3_5_moe/mhc.py` + `mhc_kernels.py`):每层两个
+  fp32 路由器(mhc_attn/mhc_ffn)——RMS 归一化的展平双流投影出 pre(坍缩成
+  branch)/post(回写每流)/mix(Sinkhorn 双随机混合);复用 DSV4 的
+  `hc_pre/post_combine` 融合内核(comb 转置语义核对过),split+Sinkhorn 按官方
+  纯 log 空间 20 次交替调度新写单内核(逐 token 一 launch,替代 ~120 次
+  微归约/路由器)。mHC 区间内残差为 [N, streams, D],边界展开(广播复制)/
+  收缩(mean)对齐官方 enter/leave;权重经通用 rename 直落模块路径,fp32 由
+  模块声明 dtype 在挂载时自然保持
+- **modelopt 纯 NVFP4 注意力 FP4 直通**(`FREETOKEN_MODELOPT_ATTN_FP4=1`,默认
+  关):社区量化版把 q/k/v/o + GDN in_proj_qkv/z/out_proj 也存成 packed FP4;
+  默认反量化 bf16 常驻会 +~2.8GB(11.9GB,3060 放不下)——开关打开后走 CT
+  方言同款 W4A16 内核(权重 q|k|v、in_proj_qkv|z 沿 dim0 融合,各部件保留
+  自己的 global scale;GDN b/a 仍 bf16 融合为 in_proj_ba)。默认关闭 = 现役
+  35B 服务路径完全不变
+
+MTP 投机解码不支持(官方 draft 头在单独 mtp.safetensors,结构未公开实现,
+`num_mtp_layers` 强制 0);vision 塔文本模式不加载(与 MiniMax-M3/Muse 同策略)。
+
+**验证**:
+- `tests/models/test_sensenova_loop.py` 7/7:官方建模代码原样收编为参考
+  (`sensenova_loop_reference.py`,Apache-2.0 注明出处)——tiny 8 层配置
+  (层 1–7 循环 ×2 + mHC)在**真实内核**上跑 prefill + 两步 decode 缓存延续,
+  logits 对官方参考 bf16 rtol 2e-2 对齐;路由器 CPU 精确对齐(streams 2/4、
+  fixed_identity);Sinkhorn 内核对 torch 参考一致到 1e-5
+- `test_qwen3_5_quant_loading.py` 13/13:FP4 直通开/关两种发射契约
+- 回归:tests/models + kvcache + moe + kernels 全绿(muse_glimmer 两次
+  ENOSPC 失败系 /tmp pytest 残留 6.3G 分片,清理后 12/12;q4_0 CPU 既有
+  1 失败不变)
+
+**3060 实测**(社区 NVFP4 版,FP4 直通开,PYTHONPATH 走 repo 树):
+- 加载 **20.9s**(35B-A3B 为 ~100s);权重+运行峰值 **10.27GiB / 12GB**,
+  8K 上下文 KV 占用近零,单请求 mamba 槽 3/8
+- 稳态 decode **25–27.5 tok/s**(引擎 gen throughput 日志)——与 35B-A3B 的
+  25.5 tok/s 持平,但此模型是 dense 全显存常驻(无 PCIe 专家流送),
+  56 次层计算/oken ≈ 14.6B 等效权重读,与 §十二/十三 内核的 282–295GB/s
+  带宽预算自洽;Fibonacci 等代码生成正确连贯
+- 陷阱记录:config 加载时 AutoConfig 对 auto_map 弹 trust_remote_code 询问,
+  无 stdin 时落空继续,属性读取不受影响;盒子直连 huggingface.co 不通,
+  下载走 `HF_ENDPOINT=https://hf-mirror.com`
+
+**取舍与边界**:对 Loop-9B 这类 dense 模型,FreeToken 的 MoE 卸载无用武之地,
+价值在"dense NVFP4 全显存常驻 + 自研 W4A16 内核 + 既有调度/服务栈";预填充
+56 遍层计算偏慢(未单独压测);hermes 切换未做(仍跑 35B-A3B)。
 
 ## 版本说明 / Versioning
 

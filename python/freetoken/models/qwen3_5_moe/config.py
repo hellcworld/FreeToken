@@ -9,6 +9,7 @@ from typing import Any
 from freetoken.models.config import (
     FullAttentionGroupConfig,
     LinearGatedDeltaGroupConfig,
+    LoopSettings,
     ModelConfig,
     RotaryConfig,
     detect_compressed_tensors_mixed_fp8,
@@ -246,6 +247,49 @@ def _layer_types(text: Any) -> list[str]:
     ]
 
 
+def _loop_settings(hf_config: Any, num_layers: int) -> LoopSettings | None:
+    """SenseNova-Loop ``loop_settings`` (+ ``mhc``) from the top-level HF config --
+    ``None`` for every non-loop checkpoint (the identity plan). Validation mirrors the
+    official remote code: fixed-count loops only, mHC confined to the looped phase."""
+    loop = getattr(hf_config, "loop_settings", None)
+    if loop is None:
+        return None
+    get = loop.get if isinstance(loop, dict) else (lambda k, d=None: getattr(loop, k, d))
+    count = get("eval_count")
+    if count is None:
+        counts = get("counts") or []
+        count = counts[0] if len(counts) == 1 else None
+    start, end, count = int(get("start")), int(get("end")), int(count)
+    counts = get("counts") or [count]
+    if list(counts) != [count]:
+        raise ValueError(f"only fixed-count loops are supported, got counts={list(counts)}")
+    mhc = getattr(hf_config, "mhc", None)
+    if mhc is None:
+        return LoopSettings(start=start, end=end, count=count)
+    mget = mhc.get if isinstance(mhc, dict) else (lambda k, d=None: getattr(mhc, k, d))
+    return LoopSettings(
+        start=start, end=end, count=count,
+        mhc_start=int(mget("start")), mhc_end=int(mget("end")),
+        streams=int(mget("streams", 2)), iterations=int(mget("iterations", 20)),
+        fixed_identity=bool(mget("fixed_identity", False)),
+        pre_scale=float(mget("pre_scale", 1.0)),
+    )
+
+
+def _expand_visit_ids(layer_ids: tuple[int, ...], ls: LoopSettings, num_layers: int) -> tuple[int, ...]:
+    """Map a physical-attention group's layer ids to their per-visit (virtual) cache-slot
+    ids: layers outside the loop keep their id; looped layers contribute one id per visit
+    (visit 1 the physical id, later visits the ``num_layers + ...`` block)."""
+    out: list[int] = []
+    for i in layer_ids:
+        if ls.start <= i < ls.end:
+            for visit in range(ls.count):
+                out.append(ls.visit_layer_id(i, visit, num_layers))
+        else:
+            out.append(i)
+    return tuple(sorted(out))
+
+
 def parse_config(hf_config: Any) -> ModelConfig:
     text = getattr(hf_config, "text_config", hf_config)
 
@@ -280,6 +324,18 @@ def parse_config(hf_config: Any) -> ModelConfig:
     # Dense attention/GDN quant is independent of the routed experts (block-fp8 already
     # quantizes both, so only probe for per-tensor FP8 when experts aren't block-fp8).
     attn_quant = "none" if expert_quant == "fp8_block" else _attn_quant(hf_config)
+    # Pure-NVFP4 modelopt checkpoints (quant_algo NVFP4, e.g. the SenseNova-Loop community
+    # build) also store the attention/GDN projections packed FP4. Default dequantizes them
+    # to bf16 at load (~+2.2 GiB on Loop-9B, which the 12 GB card only fits WITHOUT);
+    # FREETOKEN_MODELOPT_ATTN_FP4=1 keeps them native on the same W4A16 kernels the
+    # compressed-tensors dialect uses. Off by default so the serving 35B MoE checkpoints
+    # keep their proven bf16-attention path.
+    if (
+        expert_quant == "nvfp4"
+        and attn_quant == "none"
+        and os.environ.get("FREETOKEN_MODELOPT_ATTN_FP4", "") == "1"
+    ):
+        attn_quant = "nvfp4"
     # NVFP4 checkpoints store the dense MLP projections (shared_expert; dense non-MoE MLP) as
     # packed FP4 exactly like the routed experts -- independent of whether attention is FP8
     # (mixed) or bf16 (pure NVFP4). Keep them native FP4 (W4A16) whenever the experts are
@@ -322,6 +378,19 @@ def parse_config(hf_config: Any) -> ModelConfig:
     layer_types = _layer_types(text)
     full_ids = tuple(i for i, t in enumerate(layer_types) if t == "full_attention")
     linear_ids = tuple(i for i, t in enumerate(layer_types) if t == "linear_attention")
+
+    # SenseNova-Loop: expand both groups to per-visit cache-slot ids. The pools allocate
+    # from the groups, so a looped full-attention layer gets one KV slab per visit and a
+    # looped GDN layer one conv/recurrent state row per visit -- zero pool-side changes.
+    loop = _loop_settings(hf_config, text.num_hidden_layers)
+    if loop is not None:
+        if loop.end > text.num_hidden_layers:
+            raise ValueError(
+                f"loop range [{loop.start}, {loop.end}) exceeds num_hidden_layers "
+                f"{text.num_hidden_layers}"
+            )
+        full_ids = _expand_visit_ids(full_ids, loop, text.num_hidden_layers)
+        linear_ids = _expand_visit_ids(linear_ids, loop, text.num_hidden_layers)
 
     mrope_section = rope_params.get("mrope_section")
     full_rotary = RotaryConfig(
@@ -389,8 +458,14 @@ def parse_config(hf_config: Any) -> ModelConfig:
         # Trailing MTP draft head (DeepSeek-style: an eh_proj + one full-attention decoder
         # layer sharing the target embedding/lm_head). The weights stay dropped at load
         # unless the engine enables speculation (enable_mtp); only that path builds the
-        # draft module, so text-only serving never pays its VRAM.
-        num_mtp_layers=int(getattr(text, "mtp_num_hidden_layers", 0) or 0),
+        # draft module, so text-only serving never pays its VRAM. Loop checkpoints ship
+        # their MTP weights in a SEPARATE mtp.safetensors with a draft head the in-tree
+        # Qwen3_5MTPHead does not implement -- force 0 (spec unsupported) rather than
+        # build a broken draft.
+        num_mtp_layers=(
+            0 if loop is not None else int(getattr(text, "mtp_num_hidden_layers", 0) or 0)
+        ),
+        loop_settings=loop,
     )
 
 

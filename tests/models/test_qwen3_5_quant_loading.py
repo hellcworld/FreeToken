@@ -423,3 +423,112 @@ def test_pure_ct_checkpoint_emission_unchanged(tmp_path):
     assert "model.layers.0.linear_attn.in_proj_qkvz.weight" not in out
     assert out["model.layers.1.self_attn.o_proj.weight"].dtype == torch.uint8
     assert out["lm_head.weight"].dtype == torch.bfloat16
+
+
+# ------------------------------------------- modelopt pure-NVFP4 attention FP4 direct
+def _modelopt_pure_tensors():
+    """A 2-layer synthetic PURE-NVFP4 modelopt checkpoint (quant_algo NVFP4, e.g. the
+    SenseNova-Loop community build): every attention/GDN projection AND the dense MLP are
+    packed FP4 in modelopt storage (weight uint8 / weight_scale fp8 / weight_scale_2 fp32
+    scalar global); GDN b/a, conv1d, A_log, dt_bias, norms and lm_head stay bf16."""
+    t: dict[tuple[str, torch.Tensor]] = {}
+    t["model.language_model.embed_tokens.weight"] = torch.randn(V, H, dtype=torch.bfloat16) * 0.02
+    t["model.language_model.norm.weight"] = torch.ones(H, dtype=torch.bfloat16)
+    t["lm_head.weight"] = torch.randn(V, H, dtype=torch.bfloat16) * 0.02
+
+    def _packed(rows, cols, key, seed):
+        _, packed, scale, wg = _packed_nvfp4(rows, cols, seed=seed)
+        t[f"{key}.weight"] = packed
+        t[f"{key}.weight_scale"] = scale
+        t[f"{key}.weight_scale_2"] = torch.tensor([wg], dtype=torch.float32)
+
+    # layer 0: linear attention (GDN)
+    p = "model.language_model.layers.0"
+    _packed(GDN_ROWS, H, f"{p}.linear_attn.in_proj_qkv", 1)
+    _packed(48, H, f"{p}.linear_attn.in_proj_z", 2)          # value_dim rows
+    _packed(GDN_ROWS, H, f"{p}.linear_attn.out_proj", 3)
+    for proj in ("linear_attn.in_proj_b", "linear_attn.in_proj_a"):
+        t[f"{p}.{proj}.weight"] = torch.randn(16, H, dtype=torch.bfloat16) * 0.05
+    t[f"{p}.linear_attn.conv1d.weight"] = torch.randn(32, 1, 4, dtype=torch.bfloat16) * 0.05
+    t[f"{p}.linear_attn.A_log"] = torch.randn(4, dtype=torch.float32) * 0.1
+    t[f"{p}.linear_attn.dt_bias"] = torch.randn(4, dtype=torch.float32) * 0.1
+    t[f"{p}.linear_attn.norm.weight"] = torch.ones(16, dtype=torch.bfloat16)
+
+    # layer 1: full attention
+    p1 = "model.language_model.layers.1"
+    for i, proj in enumerate(("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+                              "self_attn.o_proj")):
+        _packed(Q_ROWS, H, f"{p1}.{proj}", 10 + i)
+    t[f"{p1}.self_attn.q_norm.weight"] = torch.ones(8, dtype=torch.bfloat16)
+    t[f"{p1}.self_attn.k_norm.weight"] = torch.ones(8, dtype=torch.bfloat16)
+
+    for li, pfx in ((0, p), (1, p1)):
+        for n in ("input_layernorm", "post_attention_layernorm"):
+            t[f"{pfx}.{n}.weight"] = torch.ones(H, dtype=torch.bfloat16)
+        for j, proj in enumerate(("gate_proj", "up_proj", "down_proj")):
+            rows, cols = (I, H) if proj != "down_proj" else (H, I)
+            _packed(rows, cols, f"{pfx}.mlp.{proj}", 20 + 2 * li + j)
+    return t
+
+
+_PURE_MODELOPT_QUANT = {"quant_method": "modelopt", "quant_algo": "NVFP4"}
+
+
+def _write_pure_modelopt(tmp_path):
+    return _write_ckpt(tmp_path, {
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "model_type": "qwen3_5",
+        "text_config": _text_config(),
+        "quantization_config": _PURE_MODELOPT_QUANT,
+    }, _modelopt_pure_tensors())
+
+
+def test_modelopt_pure_default_keeps_attention_bf16(tmp_path):
+    """Without the flag, a pure-NVFP4 modelopt checkpoint serves attention/GDN bf16
+    (dequant-at-load) -- the unchanged default the serving 35B checkpoints rely on."""
+    from freetoken.models.qwen3_5_moe.config import parse_config
+    from freetoken.utils import cached_load_hf_config
+
+    cfg = parse_config(cached_load_hf_config(_write_pure_modelopt(tmp_path)))
+    assert cfg.expert_quant == "nvfp4" and cfg.attn_quant == "none"
+    assert cfg.dense_quant == "nvfp4" and cfg.lm_head_quant == "none"
+
+    out = _iter(str(tmp_path))
+    fp8 = torch.float8_e4m3fn
+    # attention dequantized to bf16 and fused the plain way
+    assert out["model.layers.1.self_attn.qkv_proj.weight"].dtype == torch.bfloat16
+    assert out["model.layers.1.self_attn.o_proj.weight"].dtype == torch.bfloat16
+    assert out["model.layers.0.linear_attn.in_proj.weight"].dtype == torch.bfloat16
+    assert out["model.layers.0.linear_attn.out_proj.weight"].dtype == torch.bfloat16
+    # dense MLP stays native FP4 either way
+    assert out["model.layers.1.mlp.gate_up_proj.weight"].dtype == torch.uint8
+    assert out["model.layers.1.mlp.gate_up_proj.weight_scale"].dtype == fp8
+
+
+def test_modelopt_pure_attn_fp4_flag_nativizes_attention(tmp_path, monkeypatch):
+    """FREETOKEN_MODELOPT_ATTN_FP4=1: the packed attention/GDN projections serve native
+    on the W4A16 kernels (compressed-tensors layout), fusing q|k|v and in_proj_qkv|z."""
+    from freetoken.models.qwen3_5_moe.config import parse_config
+    from freetoken.utils import cached_load_hf_config
+
+    monkeypatch.setenv("FREETOKEN_MODELOPT_ATTN_FP4", "1")
+    cfg = parse_config(cached_load_hf_config(_write_pure_modelopt(tmp_path)))
+    assert cfg.attn_quant == "nvfp4"
+    assert cfg.dense_quant == "nvfp4"
+
+    out = _iter(str(tmp_path))
+    fp8 = torch.float8_e4m3fn
+    # full attention: fused packed q|k|v + standalone packed o_proj
+    assert out["model.layers.1.self_attn.qkv_proj.weight"].dtype == torch.uint8
+    assert out["model.layers.1.self_attn.qkv_proj.weight"].shape[0] == 3 * Q_ROWS
+    assert out["model.layers.1.self_attn.qkv_proj.weight_scale"].dtype == fp8
+    assert out["model.layers.1.self_attn.qkv_proj.weight_global"].dtype == torch.float16
+    assert out["model.layers.1.self_attn.o_proj.weight"].dtype == torch.uint8
+    assert "model.layers.1.self_attn.q_proj.weight" not in out
+    # GDN: packed qkv|z fusion + bf16 b|a fusion + packed out_proj
+    assert out["model.layers.0.linear_attn.in_proj_qkvz.weight"].dtype == torch.uint8
+    assert out["model.layers.0.linear_attn.in_proj_qkvz.weight_scale"].dtype == fp8
+    assert out["model.layers.0.linear_attn.in_proj_ba.weight"].dtype == torch.bfloat16
+    assert "model.layers.0.linear_attn.in_proj.weight" not in out
+    assert out["model.layers.0.linear_attn.out_proj.weight"].dtype == torch.uint8
+    assert out["model.layers.0.linear_attn.out_proj.weight_global"].dtype == torch.float16

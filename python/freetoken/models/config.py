@@ -222,6 +222,59 @@ def _full_group_attn_type(group: FullAttentionGroupConfig) -> AttnType:
 
 
 @dataclass(frozen=True)
+class LoopSettings:
+    """SenseNova-Loop shared-weight recurrence (HF ``loop_settings`` + ``mhc``).
+
+    The physical layers ``[start, end)`` execute ``count`` times per forward --
+    same weights, but EVERY visit owns an independent cache slot: visit 1 keeps the
+    physical layer id, visit k>=2 gets ``num_layers + (k-2)*(end-start) + (i-start)``
+    (a range above the model's layer count, so pools that validate
+    ``layer_id < num_pool_layers`` see the full virtual span). ``mhc_*`` describes the
+    manifold-constrained hyper-connections riding the same layers: ``streams``
+    parallel residual streams broadcast-expanded at ``mhc_start`` (each loop visit
+    re-expands) and mean-reduced at ``mhc_end - 1``, with per-layer routers deciding
+    the pre/post stream weights and the Sinkhorn-normalized mixing matrix.
+    """
+
+    start: int
+    end: int
+    count: int
+    # mHC (0 mhc_end -> no mhc anywhere in the model)
+    mhc_start: int = 0
+    mhc_end: int = 0
+    streams: int = 2
+    iterations: int = 20
+    fixed_identity: bool = False
+    pre_scale: float = 1.0
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.start < self.end) or self.count < 1:
+            raise ValueError(f"invalid loop range [{self.start}, {self.end}) x{self.count}")
+        if self.mhc_end > 0 and not (self.start <= self.mhc_start < self.mhc_end <= self.end):
+            # The HF plan validator allows mHC inside any loop phase; we only implement
+            # the shipped shape (mHC == the looped range, both visits re-expand/reduce).
+            raise ValueError(
+                f"mHC range [{self.mhc_start}, {self.mhc_end}) must lie inside the looped "
+                f"phase [{self.start}, {self.end})"
+            )
+        if self.streams not in (2, 4):
+            raise ValueError(f"mHC streams must be 2 or 4, got {self.streams}")
+
+    @property
+    def has_mhc(self) -> bool:
+        return self.mhc_end > 0
+
+    def owns_mhc_layer(self, layer_id: int) -> bool:
+        return self.has_mhc and self.mhc_start <= layer_id < self.mhc_end
+
+    def visit_layer_id(self, physical: int, visit: int, num_layers: int) -> int:
+        """Cache-slot layer id of ``physical`` on its ``visit``-th execution."""
+        if visit == 0:
+            return physical
+        return num_layers + (visit - 1) * (self.end - self.start) + (physical - self.start)
+
+
+@dataclass(frozen=True)
 class ModelConfig:
     num_layers: int
     num_qo_heads: int
@@ -323,6 +376,11 @@ class ModelConfig:
     # enables MTP speculation, which flips ``enable_mtp`` in Engine._adjust_config.
     num_mtp_layers: int = 0
     enable_mtp: bool = False
+    # SenseNova-Loop shared-weight recurrence (None for every non-loop model): physical
+    # layers [start, end) execute `count` times, each visit with its own KV/GDN-state
+    # slot, optionally under manifold-constrained hyper-connections. Opaque payload like
+    # the dsv4/m3 args above; only the qwen3_5_moe decoder consumes it.
+    loop_settings: LoopSettings | None = None
 
     @property
     def mtp_layer_ids(self) -> tuple[int, ...]:
@@ -331,6 +389,34 @@ class ModelConfig:
         return tuple(
             self.num_layers + i for i in range(self.num_mtp_layers if self.enable_mtp else 0)
         )
+
+    def loop_visit_pairs(self) -> tuple[tuple[int, int], ...]:
+        """Execution plan as ``(virtual, physical)`` layer-id pairs in forward order.
+
+        Non-loop models degenerate to the identity plan ``((i, i) ...)``. For a loop
+        model the middle visits' virtual ids continue above ``num_layers`` (see
+        :class:`LoopSettings`) so the attention/GDN addressing -- which reads the
+        layer id at call time -- lands each visit on its own cache slot.
+        """
+        ls = self.loop_settings
+        if ls is None:
+            return tuple((i, i) for i in range(self.num_layers))
+        pairs = [(i, i) for i in range(ls.start)]
+        for visit in range(ls.count):
+            for i in range(ls.start, ls.end):
+                pairs.append((ls.visit_layer_id(i, visit, self.num_layers), i))
+        pairs += [(i, i) for i in range(ls.end, self.num_layers)]
+        return tuple(pairs)
+
+    @property
+    def num_virtual_layers(self) -> int:
+        """Layer-execution count per forward (== ``num_layers`` for every non-loop
+        model). The KV pool validates ``layer_id < num_layers`` when remapping hybrid
+        groups, so pools for loop models must be sized by THIS count."""
+        ls = self.loop_settings
+        if ls is None:
+            return self.num_layers
+        return self.num_layers + (ls.end - ls.start) * (ls.count - 1)
 
     @property
     def is_moe(self) -> bool:

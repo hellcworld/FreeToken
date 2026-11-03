@@ -338,9 +338,12 @@ def _iter_dense_weights(
     # dequantizing to bf16. lm_head here is bf16 (pure NVFP4 doesn't quantize it).
     dense_nvfp4 = config.dense_quant == "nvfp4"
     lmhead_nvfp4 = config.lm_head_quant == "nvfp4"
+    attn_nvfp4 = config.attn_quant == "nvfp4"
     include_vision = config.is_multimodal
     shared_buf: dict[str, dict[str, torch.Tensor]] = {}
     nvfp4_shared_buf: dict[str, dict[str, tuple]] = {}
+    attn_nvfp4_buf: dict[str, dict[int, tuple]] = {}
+    ba_buf: dict[str, dict[int, torch.Tensor]] = {}
     fuse_buf: dict[str, dict[int, torch.Tensor]] = {}
 
     for file in tqdm(
@@ -387,6 +390,18 @@ def _iter_dense_weights(
                         yield from emit
                         continue
 
+                # modelopt pure-NVFP4 attention/GDN projections kept native (W4A16) under
+                # FREETOKEN_MODELOPT_ATTN_FP4=1 (the default pass leaves them bf16).
+                if attn_nvfp4 and name.endswith(".weight") \
+                        and raw_name[: -len(".weight")] + ".weight_scale_2" in keyset:
+                    emit = _attn_nvfp4_emit(
+                        f, name[: -len(".weight")], raw_name[: -len(".weight")],
+                        attn_nvfp4_buf,
+                    )
+                    if emit is not _NOT_DENSE_NVFP4:
+                        yield from emit
+                        continue
+
                 tensor = _load_maybe_quantized(f, raw_name, keyset)
 
                 # merge shared-expert gate/up -> gate_up_proj
@@ -399,6 +414,17 @@ def _iter_dense_weights(
                         del shared_buf[prefix]
                         yield f"{prefix}.mlp.shared_expert.gate_up_proj.weight", merged
                     continue
+
+                if attn_nvfp4:
+                    # the packed qkv|z left the 4-way in_proj fusion short two parts; the
+                    # bf16 b|a pair fuses on its own into in_proj_ba (the fp8 pass's split)
+                    if name.endswith(".weight"):
+                        emit = _ct_bf16_fuse(
+                            name[: -len(".weight")], tensor, ba_buf, _PT_BF16_FUSE
+                        )
+                        if emit is not None:
+                            yield from emit
+                            continue
 
                 # fuse q/k/v -> qkv_proj and GDN in_proj_{qkv,z,b,a} -> in_proj
                 fused = _try_fuse(name, tensor, fuse_buf)
@@ -414,6 +440,8 @@ def _iter_dense_weights(
 
     assert not shared_buf, f"Incomplete shared-expert merges: {list(shared_buf.keys())}"
     assert not nvfp4_shared_buf, f"Incomplete NVFP4 shared-expert merges: {list(nvfp4_shared_buf.keys())}"
+    assert not attn_nvfp4_buf, f"Incomplete NVFP4 attention fusions: {list(attn_nvfp4_buf.keys())}"
+    assert not ba_buf, f"Incomplete GDN b|a fusions: {list(ba_buf.keys())}"
     assert not fuse_buf, f"Incomplete projection fusions: {list(fuse_buf.keys())}"
 
 
@@ -503,6 +531,48 @@ def _nvfp4_parts(f, raw_base: str):
 
 # Sentinel: ``base`` is not a dense projection the model keeps native NVFP4 (caller dequantizes).
 _NOT_DENSE_NVFP4 = object()
+
+# Attention/GDN projections a modelopt pure-NVFP4 checkpoint stores packed FP4 (served
+# native under FREETOKEN_MODELOPT_ATTN_FP4=1): standalone o_proj / GDN out_proj, and the
+# two dim-0 fusions whose parts each keep their own global scale (concat stays exact).
+_ATTN_NVFP4_STANDALONE = (".self_attn.o_proj", ".linear_attn.out_proj")
+_ATTN_NVFP4_FUSIONS = (
+    (".self_attn.qkv_proj", (".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj")),
+    (".linear_attn.in_proj_qkvz", (".linear_attn.in_proj_qkv", ".linear_attn.in_proj_z")),
+)
+
+
+def _attn_nvfp4_emit(f, base: str, raw_base: str, buf: dict):
+    """Native-FP4 emission for attention/GDN projections of a pure-NVFP4 modelopt
+    checkpoint when the model serves them W4A16 (attn_quant=="nvfp4"). Mirrors
+    :func:`_dense_nvfp4_emit`: ``(key, tensor)`` triples for standalone layers, the
+    fused q|k|v and in_proj_qkv|z concat along dim 0, ``[]`` while buffered, or
+    ``_NOT_DENSE_NVFP4`` when the layer is not an attention projection (b/a have no
+    ``weight_scale_2`` in modelopt exports, so they never reach this helper)."""
+    for suffix in _ATTN_NVFP4_STANDALONE:
+        if base.endswith(suffix):
+            w, s, g = _nvfp4_parts(f, raw_base)
+            return [(base + ".weight", w), (base + ".weight_scale", s), (base + ".weight_global", g)]
+    for fused_suffix, parts in _ATTN_NVFP4_FUSIONS:
+        for idx, part in enumerate(parts):
+            if base.endswith(part):
+                w, s, g = _nvfp4_parts(f, raw_base)
+                key = base[: -len(part)] + fused_suffix
+                slots = buf.setdefault(key, {})
+                slots[idx] = (w, s, g)
+                if len(slots) != len(parts):
+                    return []
+                del buf[key]
+                merged = [
+                    torch.cat([slots[i][j] for i in range(len(parts))], dim=0)
+                    for j in range(3)
+                ]
+                return [
+                    (key + ".weight", merged[0]),
+                    (key + ".weight_scale", merged[1]),
+                    (key + ".weight_global", merged[2]),
+                ]
+    return _NOT_DENSE_NVFP4
 
 
 def _dense_nvfp4_emit(

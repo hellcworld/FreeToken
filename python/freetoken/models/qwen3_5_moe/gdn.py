@@ -78,13 +78,23 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         self._block_fp8 = expert_quant == "fp8_block"
         self._pertensor_fp8 = attn_quant == "fp8_pertensor"
         self._fp8 = self._block_fp8 or self._pertensor_fp8
+        # modelopt pure-NVFP4 with FREETOKEN_MODELOPT_ATTN_FP4=1: qkvz packed FP4 (W4A16),
+        # b/a bf16 (modelopt never quantizes them) -- the same split as the fp8 mode below.
+        self._attn_nvfp4 = attn_quant == "nvfp4"
 
         self._in_proj_split = [self.conv_dim, self.value_dim, num_v_heads, num_v_heads]
-        if self._fp8:
-            ColMerged = Fp8BlockColMerged if self._block_fp8 else Fp8PerTensorColMerged
-            self.in_proj_qkvz = ColMerged(
-                hidden_size, [self.conv_dim, self.value_dim], has_bias=False
-            )
+        if self._fp8 or self._attn_nvfp4:
+            if self._fp8:
+                ColMerged = Fp8BlockColMerged if self._block_fp8 else Fp8PerTensorColMerged
+                self.in_proj_qkvz = ColMerged(
+                    hidden_size, [self.conv_dim, self.value_dim], has_bias=False
+                )
+            else:
+                from freetoken.kernel.triton.nvfp4_linear import Nvfp4DenseColMerged
+
+                self.in_proj_qkvz = Nvfp4DenseColMerged(
+                    hidden_size, [self.conv_dim, self.value_dim], has_bias=False
+                )
             self.in_proj_ba = LinearColParallelMerged(
                 hidden_size, [num_v_heads, num_v_heads], has_bias=False
             )
@@ -99,9 +109,10 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         self.dt_bias = torch.empty(num_v_heads, dtype=torch.float32)
         self.A_log = torch.empty(num_v_heads, dtype=torch.float32)
         self.norm = _GatedRMSNorm(head_v_dim, eps=rms_norm_eps)
-        # out_proj follows the checkpoint quant: block-fp8 / per-tensor-fp8 / compressed-tensors
-        # NVFP4 (W4A16) / bf16. in_proj_* stay bf16 in every mode (above), so a compressed-tensors
-        # NVFP4 checkpoint (attn_quant=="nvfp4") only makes out_proj native FP4.
+        # out_proj follows the checkpoint quant: block-fp8 / per-tensor-fp8 / NVFP4
+        # (W4A16 -- compressed-tensors, or modelopt with FREETOKEN_MODELOPT_ATTN_FP4=1) /
+        # bf16. In every mode except the modelopt FP4 one the in_proj_* above stay bf16 or
+        # fp8 (a compressed-tensors NVFP4 checkpoint only quantizes out_proj).
         self.out_proj = make_replicated_quant(
             expert_quant, attn_quant, self.value_dim, hidden_size, has_bias=False
         )
@@ -162,7 +173,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             fla = build_fla_metadata(batch, hidden_states.device)
             batch.fla_metadata = fla
 
-        if self._fp8:
+        if self._fp8 or self._attn_nvfp4:
             qkvz = self.in_proj_qkvz.forward(hidden_states)
             conv_in, z = torch.split(qkvz, [self.conv_dim, self.value_dim], dim=-1)
             ba = self.in_proj_ba.forward(hidden_states)

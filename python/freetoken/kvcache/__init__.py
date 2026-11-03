@@ -179,9 +179,12 @@ def create_kvcache_pool(
     # (global ids [num_layers, num_layers + num_mtp_layers)), addressed through the same
     # page table so allocation/rollback ride the existing machinery. Only reached for the
     # plain MHA family — Engine._adjust_config rejects every other pool family for spec.
-    num_pool_layers = model_config.num_layers + len(
-        getattr(model_config, "mtp_layer_ids", ()) or ()
-    )
+    # Loop models (SenseNova-Loop): the per-visit virtual ids of a looped layer's later
+    # visits continue above num_layers, so the pool's layer-id validation range must span
+    # the VIRTUAL layer count (identity with num_layers for every non-loop model).
+    num_pool_layers = getattr(
+        model_config, "num_virtual_layers", model_config.num_layers
+    ) + len(getattr(model_config, "mtp_layer_ids", ()) or ())
 
     # GQA block-sparse (MiniMax-M3): one full-attention group carrying the index dims
     # with mla=False -> the MHA pool plus the index-key slab. The same spec fields

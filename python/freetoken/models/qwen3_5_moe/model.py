@@ -25,7 +25,11 @@ if TYPE_CHECKING:
 class Qwen3_5DecoderLayer(BaseOP):
     """Pre-norm hybrid block: ``x = x + mixer(input_norm(x)); x = x + moe(post_norm(x))``,
     where the mixer is a GatedDeltaNet (linear layers) or gated attention (full layers).
-    All norms are Gemma-style (1+weight)."""
+    All norms are Gemma-style (1+weight).
+
+    Loop models (SenseNova-Loop): layers inside the mHC range instead carry ``streams``
+    parallel residual streams routed by the fp32 ``mhc_attn``/``mhc_ffn`` routers --
+    :meth:`forward_mhc`. The standard :meth:`forward` is untouched."""
 
     def __init__(self, config: ModelConfig, layer_id: int):
         self._layer_id = layer_id
@@ -52,6 +56,25 @@ class Qwen3_5DecoderLayer(BaseOP):
         self.mlp = Qwen3_5MoE(config, layer_id) if config.moe_enabled else Qwen3_5DenseMLP(config)
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # SenseNova-Loop mHC: this physical layer routes its residual through parallel
+        # streams. Routers are fp32 (the mount keeps the module's declared dtype).
+        ls = config.loop_settings
+        self._mhc = ls if (ls is not None and ls.owns_mhc_layer(layer_id)) else None
+        if self._mhc is not None:
+            from .mhc import MHCRouter
+
+            self.mhc_attn = MHCRouter(config.hidden_size, ls)
+            self.mhc_ffn = MHCRouter(config.hidden_size, ls)
+
+    def set_visit_layer_id(self, virtual: int) -> None:
+        """Point the mixer's cache addressing at this VISIT's slot (loop layer re-entry).
+        The physical layer object is shared across visits; the slot id is read at each
+        kernel launch, so the mutation is safe under single-threaded forwards and bakes
+        per-visit into CUDA graph captures."""
+        if self._is_linear:
+            self.linear_attn.layer_id = virtual
+        else:
+            self.self_attn.layer_id = virtual
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     def forward(self, hidden: torch.Tensor, residual: torch.Tensor | None):
@@ -67,6 +90,21 @@ class Qwen3_5DecoderLayer(BaseOP):
         hidden = self.mlp.forward(hidden)
         return hidden, residual
 
+    @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
+    def forward_mhc(self, streams: torch.Tensor) -> torch.Tensor:
+        """mHC form (HF MHCDecoderLayer): routers decide the pre/post stream weights and
+        the Sinkhorn mixing matrix around each sublayer; the branch each sublayer sees is
+        the router's pre-weighted stream sum, normed by the layer's own Gemma norms."""
+        from .mhc import mhc_merge
+
+        branch, post, mix = self.mhc_attn.route(streams)
+        branch = self.input_layernorm.forward(branch)
+        branch = self.linear_attn.forward(branch) if self._is_linear else self.self_attn.forward(branch)
+        streams = mhc_merge(streams, branch, post, mix)
+        branch, post, mix = self.mhc_ffn.route(streams)
+        branch = self.mlp.forward(self.post_attention_layernorm.forward(branch))
+        return mhc_merge(streams, branch, post, mix)
+
 
 class Qwen3_5Model(BaseOP):
     def __init__(self, config: ModelConfig):
@@ -79,6 +117,10 @@ class Qwen3_5Model(BaseOP):
         )
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self._image_token_id = config.image_token_id
+        # Loop execution plan ((virtual, physical) pairs); the identity plan for every
+        # non-loop model. mhc settings cached for the boundary expand/reduce below.
+        self._plan = config.loop_visit_pairs()
+        self._mhc = config.loop_settings
 
     def _merge_multimodal(self, input_ids: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         """Replace the ``image_token_id`` placeholder embeddings with the vision tower
@@ -98,9 +140,40 @@ class Qwen3_5Model(BaseOP):
         x = self.embed_tokens.forward(input_ids)
         x = self._merge_multimodal(input_ids, x)
         residual: torch.Tensor | None = None
-        for layer in self.layers.op_list:
-            x, residual = layer.forward(x, residual)
-        x, _ = self.norm.forward_add_residual(x, residual)
+        # Plan-driven walk (identity order for non-loop models): a looped physical layer
+        # re-enters with its visit's virtual cache-slot id; the mHC range switches the
+        # residual to [N, streams, D] between its boundaries (re-expanded and re-reduced
+        # on EVERY visit -- the HF plan keeps mHC inside one loop phase).
+        for virtual, physical in self._plan:
+            layer = self.layers.op_list[physical]
+            mhc = layer._mhc
+            if mhc is not None:
+                if physical == mhc.mhc_start:
+                    # standard layer leaves the residual add deferred; the router reads
+                    # the summed stream, so materialize it here (one add kernel)
+                    h = x if residual is None else x + residual
+                    streams = (
+                        h.unsqueeze(-2)
+                        .expand(*h.shape[:-1], mhc.streams, h.shape[-1])
+                        .contiguous()
+                    )
+                    residual = None
+                else:
+                    streams = x
+                layer.set_visit_layer_id(virtual)
+                streams = layer.forward_mhc(streams)
+                if physical == mhc.mhc_end - 1:
+                    x = streams.mean(dim=-2)
+                    residual = None
+                else:
+                    x = streams
+            else:
+                layer.set_visit_layer_id(virtual)
+                x, residual = layer.forward(x, residual)
+        if residual is None:
+            x = self.norm.forward(x)
+        else:
+            x, _ = self.norm.forward_add_residual(x, residual)
         return x
 
 

@@ -65,6 +65,16 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.qwen3_5_moe",
         "Qwen3_5MoEForCausalLM",
     ),
+    # SenseNova-Loop-9B (model_type sensenova_loop): Qwen3.5-family hybrid GDN decoder whose
+    # physical layers [4, 28) execute TWICE per forward (shared weights; every visit owns its
+    # own KV slab / GDN state slot via virtual layer ids) under manifold-constrained
+    # hyper-connections (mHC: fp32 per-layer routers, Sinkhorn-normalized dual residual
+    # streams re-expanded per visit). Dense SwiGLU MLP; served text-only; the loop is entirely
+    # config-driven (loop_settings/mhc in config.json), so the qwen3_5_moe classes serve it.
+    "SenseNovaLoopForConditionalGeneration": ModelSpec(
+        "freetoken.models.qwen3_5_moe",
+        "Qwen3_5MoEForCausalLM",
+    ),
     # Muse-Glimmer-30B (model_type muse_glimmer): multimodal wrapper config (text tower in
     # text_config, weights under model.language_model.); served text-only. Dense gated GQA
     # with a [SWA x3, full] pattern -- full layers are NoPE -- weightless qk norms, centered
