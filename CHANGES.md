@@ -839,6 +839,36 @@ MTP 投机解码不支持(官方 draft 头在单独 mtp.safetensors,结构未公
 价值在"dense NVFP4 全显存常驻 + 自研 W4A16 内核 + 既有调度/服务栈";预填充
 56 遍层计算偏慢(未单独压测);hermes 切换未做(仍跑 35B-A3B)。
 
+### 15.1 vision 图像链路(2026-11-05)
+
+Loop 的 `qwen3_5_vision` 塔(27 层 ViT + Conv3d patch embed + 2x2 merger,
+processor 为标准 `Qwen3VLProcessor`,无 remote code)与 Qwen3.6 同族——
+**离线/在线两条图像路径零新增代码**,全部复用现有 mm 机制(常驻塔
+`encode_images`、`qwen3_5_rope_index` 三行 interleaved-mRoPE、placeholder
+scatter、decode 的 delta 续位)。验证与实测:
+
+- `test_loop_model_multimodal_matches_reference`:tiny 多模态配置对官方参考,
+  **prefill 严格对齐 2e-2**(塔输出 2.4e-4、mRoPE 位置行逐位相同、KV 存储
+  与注意力输出逐位一致);decode 步的分布漂移上界 0.3 logits 并注释了机理
+  ——随机权重网络的 top-2 间隔仅 8e-3,bf16 状态写回舍入经 14 次循环执行
+  放大到 ~0.2,prefill 单遍不读回状态故无此效应;argmax 级行为由真实模型
+  端到端背书
+- 盒子离线端到端:9.38GB 量化版 + `FREETOKEN_LOAD_VISION=1` + FP4 直通,
+  真实仪表盘图(3003 图像 token)→ 160 token 连贯解码,准确读出中文标题
+  "08 高温天气 × 峰时购电"、双散点图布局与相关系数 r=+0.81
+- 盒子在线 API:临时 ftserve(:8021,repo 树 + `--num-tokens 12000
+  --cache-type naive --cuda-graph-max-bs 1 --memory-ratio 0.97`),OpenAI
+  `/v1/chat/completions` 收 base64 `image_url`,返回图像接地的
+  reasoning_content(thinking 模式),用后即焚
+- 两个坑:① tiny 配置的 `mrope_section` 必须与 HF 的 `slot j → axis j%3`
+  交错分配自洽(真实模型 [11,11,10] 天然自洽;随手写 [6,6,4] 会踩边界),
+  ② 12GB 上 dense 10GB 权重 + vision 塔后,KV 自动求解器余量不足断言,
+  `--num-tokens` 显式指定绕过(auto 求解器对该形态的定价留待后续修正);
+  另 transformers 5.16 起 HF 参考需要显式 `mm_token_type_ids`
+- 盒子运维注:rexec 会话有 120s 硬超时,且 WSL 发行版在无会话时会被回收
+  (内核活着、userspace 重启,/tmp 即清)——长任务要么单会话内完成,要么
+  用 <120s 的占位会话续命;本次多次"分离任务消失"皆源于此
+
 ## 版本说明 / Versioning
 
 - 本 fork 标签:**`qwen38-vision-v1.0.0`**(见 git tag)

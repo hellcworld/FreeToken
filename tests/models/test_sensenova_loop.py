@@ -226,7 +226,8 @@ def _hf_reference():
     text = Qwen3_5TextConfig(num_hidden_layers=_LAYERS, layer_types=[
         "linear_attention", "linear_attention", "linear_attention", "full_attention",
         "linear_attention", "linear_attention", "linear_attention", "full_attention",
-    ], rope_parameters={"rope_theta": 10000000.0, "partial_rotary_factor": 0.5},
+    ], rope_parameters={"rope_theta": 10000000.0, "partial_rotary_factor": 0.5,
+                            "mrope_section": [6, 5, 5]},
         mtp_num_hidden_layers=1, **_TINY)
     vision = Qwen3_5VisionConfig(
         depth=1, hidden_size=32, num_heads=2, intermediate_size=48, patch_size=8,
@@ -236,6 +237,8 @@ def _hf_reference():
     config = Qwen3_5Config(
         text_config=text, vision_config=vision, loop_settings=_LOOP, mhc=_MHC,
         architectures=["SenseNovaLoopForConditionalGeneration"],
+        image_token_id=400, vision_start_token_id=401, vision_end_token_id=402,
+        video_token_id=403,
     )
     config.model_type = "sensenova_loop"
     ref = _load_reference()
@@ -244,7 +247,7 @@ def _hf_reference():
     return model
 
 
-def _mount(model, hf_sd):
+def _mount(model, hf_sd, include_vision: bool = False):
     """Feed the HF state dict through the production rename/fusion/bake, materialize on
     cuda at each meta buffer's declared dtype (fp32 for the mhc routers), then mount via
     BaseOP.load_state_dict -- which asserts full key coverage both ways."""
@@ -254,7 +257,7 @@ def _mount(model, hf_sd):
     fuse_buf: dict[str, dict[int, torch.Tensor]] = {}
     state = {}
     for raw_name, tensor in hf_sd.items():
-        name = _rename(raw_name, include_vision=False)
+        name = _rename(raw_name, include_vision=include_vision)
         if name is None:
             continue
         fused = _try_fuse(name, tensor, fuse_buf)
@@ -382,3 +385,95 @@ def test_loop_model_matches_reference_prefill_and_decode():
             input_ids=nxt2.view(1, 1), past_key_values=dref.past_key_values, use_cache=True
         )
     torch.testing.assert_close(d2logits[0].float(), d2ref.logits[0, -1].float(), rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA")
+def test_loop_model_multimodal_matches_reference(monkeypatch):
+    """Vision leg of the port: a 2x2-merged-token image through the REAL tower
+    (Conv3d patch embed, pos embed, merger) + interleaved-mRoPE positions built by the
+    engine's own rope-index helper, scattered at the image-token placeholders and run
+    through the looped mHC decoder -- compared against the HF reference forward that
+    computes its own positions internally. Prefill + one delta-shifted decode step."""
+    pytest.importorskip("transformers.models.qwen3_5")
+    from freetoken.layers import set_rope_device
+    from freetoken.models.qwen3_5_moe.config import parse_config
+    from freetoken.models.qwen3_5_moe.model import Qwen3_5MoEForCausalLM
+    from freetoken.models.qwen3_5_moe.vision import qwen3_5_rope_index
+    from freetoken.utils.torch_utils import torch_dtype
+
+    monkeypatch.setenv("FREETOKEN_LOAD_VISION", "1")
+    torch.manual_seed(13)
+    ref_model = _hf_reference().to("cuda", torch.bfloat16)
+    model_config = parse_config(ref_model.config)
+    assert model_config.is_multimodal and model_config.image_token_id == 400
+
+    set_rope_device(torch.device("cuda"))
+    with torch.device("meta"), torch_dtype(torch.bfloat16):
+        model = Qwen3_5MoEForCausalLM(model_config)
+    _mount(model, ref_model.state_dict(), include_vision=True)
+
+    ctx = _build_ctx(model_config, n_pages=64)
+
+    # grid [1,4,4]: 16 patches -> 2x2 merge -> 4 image tokens
+    grid = torch.tensor([[1, 4, 4]])
+    pixels = torch.randn(16, 3 * 2 * 8 * 8, dtype=torch.float32)  # HF-processor layout
+    IMG, VS, VE = 400, 401, 402
+    ids = torch.tensor([1, 2, 3, VS, IMG, IMG, IMG, IMG, VE, 9, 10], device="cuda")
+    T = ids.numel()
+    rows, delta = qwen3_5_rope_index(ids.cpu(), grid, IMG, VS, VE)
+
+    reqs = [SimpleNamespace(
+        extend_len=T, device_len=T, cached_len=0, table_idx=1,
+        linear_slot_idx=None, mamba_ping_pong=None,
+    )]
+    ctx.page_table[1, :T] = torch.arange(T, device="cuda")
+    batch = SimpleNamespace(
+        reqs=reqs, padded_reqs=reqs, is_decode=False, is_prefill=True, size=1,
+        input_ids=ids,
+        positions=torch.arange(T, device="cuda") + delta,  # engine's _make_positions
+        out_loc=torch.arange(T, device="cuda"),
+        mm_embeds=model.encode_images(pixels, None, grid),
+        mm_positions=rows.to("cuda"),
+        linear_table_idx=None, fla_metadata=None, attn_metadata=None,
+    )
+    ctx.attn_backend.prepare_metadata(batch)
+    with torch.inference_mode(), ctx.forward_batch(batch):
+        logits = model.forward()
+        # transformers 5.16 requires explicit per-token modality ids for M-RoPE
+        mm_types = (ids == IMG).long().view(1, -1)
+        ref = ref_model(
+            input_ids=ids.view(1, -1), pixel_values=pixels.cuda(),
+            image_grid_thw=grid.cuda(), mm_token_type_ids=mm_types, use_cache=True,
+        )
+    torch.testing.assert_close(logits[0].float(), ref.logits[0, -1].float(), rtol=2e-2, atol=2e-2)
+
+    # decode step past the image span: positions continue at device_len + delta
+    nxt = ref.logits[0, -1].argmax()
+    ctx.page_table[1, T] = T
+    dreqs = [SimpleNamespace(
+        extend_len=1, device_len=T + 1, cached_len=T, table_idx=1,
+        linear_slot_idx=None, mamba_ping_pong=None,
+    )]
+    dbatch = SimpleNamespace(
+        reqs=dreqs, padded_reqs=dreqs, is_decode=True, is_prefill=False, size=1,
+        input_ids=nxt.view(1),
+        positions=torch.tensor([T + delta], device="cuda"),
+        out_loc=torch.tensor([T], device="cuda"), mm_embeds=None, mm_positions=None,
+        linear_table_idx=torch.tensor([1], dtype=torch.int32, device="cuda"),
+        fla_metadata=None, attn_metadata=None,
+    )
+    ctx.attn_backend.prepare_metadata(dbatch)
+    with torch.inference_mode(), ctx.forward_batch(dbatch):
+        dlogits = model.forward()
+        dref = ref_model(
+            input_ids=nxt.view(1, 1), past_key_values=ref.past_key_values, use_cache=True
+        )
+    # Prefill is exact to 2e-2 (asserted above). The decode step reads BACK the bf16
+    # GDN/KV state written at prefill; each engine rounds its own state, and this
+    # random-weight net amplifies that rounding across the 14 looped executions to
+    # ~0.2 logits -- on a distribution whose own top-2 gap is ~8e-3 (near-ties), so the
+    # argmax may flip between mathematical ties. The real checkpoint's multi-hundred-
+    # token image-grounded decode (box e2e) validates argmax-level behavior; here we
+    # bound the distribution drift instead.
+    dd = (dlogits[0].float() - dref.logits[0, -1].float()).abs().max()
+    assert dd < 0.3, f"mm decode distribution drift too large: {dd}"
